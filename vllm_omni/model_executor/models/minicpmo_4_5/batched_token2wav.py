@@ -12,6 +12,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 _SILENCE_TOKEN = 4218
 
 
@@ -476,3 +480,50 @@ class BatchedToken2Wav(nn.Module):
         ]
         audios = [emitted[row].reshape(-1).to(dtype=torch.float32) for row in range(batch_size)]
         return audios, next_states
+
+    @torch.inference_mode()
+    def warmup(self, prompt_wav: str, batch_sizes=(1,), chunk_frames: int = 28) -> None:
+        """Exercise the full prepare->setup->decode path before the first live request.
+
+        The bench client's ``--num-warmups`` only warms the *client* side; the
+        Code2Wav stage otherwise pays its entire cold-start cost on the first
+        real request:
+
+        - first ``prepare_prompt``: s3tokenizer ONNX session, torchaudio
+          resample kernels, mel filterbank construction (CPU);
+        - first ``setup_batch``: flow encoder pre-lookahead/upsample kernels
+          plus a full n_timesteps CFM pass over the prompt mel;
+        - first ``decode_batch``: conformer/DiT/HiFT kernel autotuning on the
+          accelerator for the streaming chunk shapes.
+
+        Uses the model's own reference audio so no request data is needed.
+        State is fully discarded afterwards (states are local; the prompt
+        feature cache entry is evicted), so live requests are unaffected.
+
+        Args:
+            prompt_wav: reference audio to drive the warmup.
+            batch_sizes: batch dimensions to exercise (match max_num_seqs).
+            chunk_frames: codec frames per streamed chunk (25 data + 3 left
+                context = 28 by default).
+        """
+        device = self.speech_window.device
+        cache_id = "__warmup__"
+        logger.info("Code2Wav warmup: start (batch_sizes=%s, chunk_frames=%d)", list(batch_sizes), chunk_frames)
+        try:
+            features = self.prepare_prompt(cache_id, prompt_wav)
+            for batch_size in batch_sizes:
+                states = self.setup_batch(features, batch_size)
+                tokens = torch.zeros((batch_size, chunk_frames), dtype=torch.long, device=device)
+                # One mid-stream chunk and one final chunk cover both decode
+                # branches (non-final keeps the tail cache; final emits it).
+                self.decode_batch(tokens, features, states, last_chunk=False)
+                self.decode_batch(tokens, features, states, last_chunk=True)
+            torch.accelerator.synchronize(device)
+            logger.info("Code2Wav warmup: done")
+        except Exception:
+            # Warmup must never take the stage down: log and let the first
+            # real request pay the cold-start cost instead.
+            logger.exception("Code2Wav warmup failed (continuing without it)")
+        finally:
+            self.evict_prompt(cache_id, prompt_wav)
+            torch.accelerator.empty_cache()

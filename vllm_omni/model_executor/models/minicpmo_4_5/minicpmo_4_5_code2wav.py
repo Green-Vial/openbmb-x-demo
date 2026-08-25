@@ -184,6 +184,36 @@ class MiniCPMO45Code2Wav(nn.Module):
             extra = getattr(connector, "extra", None)
         return dict(extra) if isinstance(extra, Mapping) else {}
 
+    def _warmup_code2wav(self) -> None:
+        """Pre-compile Code2Wav kernels before the first live request.
+
+        ``vllm bench --num-warmups`` only warms the client side. The first
+        real request through Code2Wav otherwise pays: ONNX/S3Tokenizer session
+        init, mel filterbank + resampler build, flow encoder / DiT / HiFT
+        kernel autotune on the accelerator, plus a full CFM pass over the
+        prompt mel (all of it hidden inside the first Seed-TTS TTFP). Warm up
+        once here using the model's own reference audio; any failure is
+        non-fatal (the stage keeps serving, just cold on request #1).
+        """
+        if self.backend is None:
+            return
+        # Default warmup switch: disabled only if explicitly requested.
+        extra = self._extra_config()
+        if str(extra.get("code2wav_warmup", "auto")).lower() in ("0", "false", "off", "no"):
+            return
+        prompt_wav = self._default_prompt_wav
+        if not Path(prompt_wav).is_file():
+            logger.warning("Code2Wav warmup skipped: prompt audio missing (%s)", prompt_wav)
+            return
+        try:
+            max_batch = int(getattr(getattr(self.vllm_config, "scheduler_config", None), "max_num_seqs", 1))
+        except (TypeError, ValueError):
+            max_batch = 1
+        batch_sizes = tuple(
+            sorted({1, max_batch})
+        )
+        self.backend.warmup(prompt_wav, batch_sizes=batch_sizes)
+
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         return torch.zeros((input_ids.numel(), 1), device=input_ids.device, dtype=torch.float32)
 
@@ -782,3 +812,4 @@ class MiniCPMO45Code2Wav(nn.Module):
         finally:
             torch.set_default_dtype(previous_dtype)
         self.backend = BatchedToken2Wav(token2wav)
+        self._warmup_code2wav()

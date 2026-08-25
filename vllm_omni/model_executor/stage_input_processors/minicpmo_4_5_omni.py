@@ -105,6 +105,47 @@ def _coerce_token_id_list(value):
     return out
 
 
+# T4: resolve the fixed MiniCPM-o 4.5 TTS boundary ids once at import time.
+# These are model constants (see llm2tts' plain-chat fallback below); resolving
+# them per request via the tokenizer was pure repeated work.
+_MINICPMO45_TTS_BOS_ID = 151703
+_MINICPMO45_TTS_END_IDS = frozenset({151704, 151645})
+
+
+def _find_tts_span(full_token_ids, tts_bos_id, tts_end_ids, prompt_len, is_native_duplex):
+    """T3: vectorized TTS span location (replaces two Python scan loops).
+
+    Semantics preserved from the loop version:
+    - bos: LAST occurrence of ``tts_bos_id`` at or after ``search_start``,
+      slice starts one past it;
+    - eos: FIRST boundary id after the slice start;
+    - plain-chat fallback: no explicit <|tts_bos|> -> condition on the whole
+      generated assistant span.
+    Returns (bos_idx, eos_idx) with the same None conventions as before.
+    """
+    ids = full_token_ids if isinstance(full_token_ids, torch.Tensor) else torch.as_tensor(
+        full_token_ids, dtype=torch.long
+    )
+    search_start = max(0, prompt_len - 1) if is_native_duplex else 0
+
+    bos_matches = (ids[search_start:] == tts_bos_id).nonzero(as_tuple=False).flatten()
+    if bos_matches.numel() > 0:
+        bos_idx = int(bos_matches[-1].item()) + 1
+    elif not is_native_duplex and len(ids) > prompt_len:
+        bos_idx = prompt_len
+    else:
+        bos_idx = None
+
+    eos_idx = None
+    if bos_idx is not None:
+        end_ids = torch.as_tensor(sorted(tts_end_ids), dtype=ids.dtype, device=ids.device)
+        tail = ids[bos_idx:]
+        end_hits = torch.isin(tail, end_ids).nonzero(as_tuple=False).flatten()
+        if end_hits.numel() > 0:
+            eos_idx = bos_idx + int(end_hits[0].item())
+    return bos_idx, eos_idx
+
+
 def _to_transport_list(value):
     if hasattr(value, "detach"):
         value = value.detach().cpu()
@@ -788,31 +829,22 @@ def llm2tts(
         # Plain-chat (use_tts_template) fallback: non-duplex requests do not
         # surface special_token_ids, so use MiniCPM-o 4.5's fixed boundaries.
         if tts_bos_id is None and not is_native_duplex_handoff:
-            tts_bos_id = 151703
-            tts_end_ids = set(tts_end_ids) | {151704, 151645}
+            tts_bos_id = _MINICPMO45_TTS_BOS_ID
+            tts_end_ids = set(tts_end_ids) | _MINICPMO45_TTS_END_IDS
 
-        tts_bos_idx = None
-        # For native duplex the resumable prompt folds every earlier unit, so
-        # a <|tts_bos|> from an already-spoken reply can sit mid-prompt; only
-        # a boundary folded as the FINAL prompt token (this unit's decision)
-        # or one inside the current segment may start the slice, or stale
-        # text would be re-handed to the talker on text-less continuations.
-        search_start = max(0, prompt_token_ids_len - 1) if is_native_duplex_handoff else 0
-        for idx_t in range(search_start, len(full_token_ids)):
-            if full_token_ids[idx_t] == tts_bos_id:
-                tts_bos_idx = idx_t + 1
+        # T3: vectorized boundary scan (was: two Python for-loops over ids).
+        tts_bos_idx, tts_eos_idx = _find_tts_span(
+            full_token_ids,
+            tts_bos_id,
+            tts_end_ids,
+            prompt_token_ids_len,
+            is_native_duplex_handoff,
+        )
         if tts_bos_idx is None and not is_native_duplex_handoff and llm_output_ids:
             # Audio routing is a model-stage concern, not an OpenAI serving
             # default. Plain chat templates do not include <|tts_bos|>; in
             # that case condition the Talker on the generated assistant span.
             tts_bos_idx = prompt_token_ids_len
-
-        tts_eos_idx = None
-        if tts_bos_idx is not None:
-            for idx_t in range(tts_bos_idx, len(full_token_ids)):
-                if full_token_ids[idx_t] in tts_end_ids:
-                    tts_eos_idx = idx_t
-                    break
 
         tts_token_ids_slice = tts_hidden_slice = None
         native_segment_end = False
@@ -825,7 +857,7 @@ def llm2tts(
                     special_token_ids.get("chunk_tts_eos_token_id"),
                 }
             tts_token_ids_slice = torch.tensor(full_token_ids[tts_bos_idx:end_idx], dtype=torch.long)
-            tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].to(torch.float32).contiguous()
+            tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].contiguous()  # T2: keep native dtype
         elif is_native_duplex_handoff:
             # Official MiniCPM-o duplex does not prefill an assistant
             # <|tts_bos|> boundary before generation. A segment delta can
@@ -869,10 +901,8 @@ def llm2tts(
                 if hidden_base >= 0 and out_end > out_start:
                     tts_token_ids_slice = torch.tensor(out_ids[out_start:out_end], dtype=torch.long)
                     tts_hidden_slice = (
-                        thinker_hidden_states[hidden_base + out_start : hidden_base + out_end]
-                        .to(torch.float32)
-                        .contiguous()
-                    )
+                        thinker_hidden_states[hidden_base + out_start : hidden_base + out_end].contiguous()
+                    )  # T2: keep native dtype
             elif j < len(out_ids) and out_ids[j] not in tts_end_ids:
                 # HF streaming_generate does not require an explicit <|speak|>
                 # marker. If a unit starts directly with text, the first token
@@ -897,10 +927,8 @@ def llm2tts(
                 if hidden_base >= 0 and out_end > out_start:
                     tts_token_ids_slice = torch.tensor(out_ids[out_start:out_end], dtype=torch.long)
                     tts_hidden_slice = (
-                        thinker_hidden_states[hidden_base + out_start : hidden_base + out_end]
-                        .to(torch.float32)
-                        .contiguous()
-                    )
+                        thinker_hidden_states[hidden_base + out_start : hidden_base + out_end].contiguous()
+                    )  # T2: keep native dtype
         handoff_ids = _coerce_token_id_list(tts_token_ids_slice) if tts_token_ids_slice is not None else None
         if is_native_duplex_handoff and handoff_ids:
             handoff_text = _decode_native_duplex_token_ids(
