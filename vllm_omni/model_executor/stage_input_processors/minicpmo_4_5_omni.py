@@ -130,7 +130,9 @@ def _find_tts_span(full_token_ids, tts_bos_id, tts_end_ids, prompt_len, is_nativ
 
     bos_matches = (ids[search_start:] == tts_bos_id).nonzero(as_tuple=False).flatten()
     if bos_matches.numel() > 0:
-        bos_idx = int(bos_matches[-1].item()) + 1
+        # bos_matches are indices relative to ids[search_start:], so the
+        # global bos index is search_start + rel.
+        bos_idx = search_start + int(bos_matches[-1].item()) + 1
     elif not is_native_duplex and len(ids) > prompt_len:
         bos_idx = prompt_len
     else:
