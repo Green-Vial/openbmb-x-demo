@@ -113,6 +113,25 @@ def _to_transport_list(value):
     return value
 
 
+def _to_transport_tensor(value):
+    """P1: DO NOT USE for stage handoff tensors.
+
+    Keeping a CPU tensor here looks correct, but ``model_intermediate_buffer``
+    crosses stages through vLLM's ``MsgpackEncoder`` (EngineCoreRequest is a
+    msgspec.Struct), NOT OmniSerializer. Msgpack encodes the tensor as the
+    metadata tuple ``(dtype, shape, raw_bytes)``; since the value is inside a
+    ``dict[str, Any]`` there is no type hint to trigger ``MsgpackDecoder``'s
+    tensor restore, so the talker receives a plain list like
+    ``['float32', [3,4], <memory>]`` and ``torch.as_tensor`` blows up with
+    ``ValueError: too many dimensions 'str'``.
+    Use ``_to_transport_list`` (nested float lists) which the receiver
+    normalizes back into a tensor.
+    """
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().contiguous()
+    return value
+
+
 def _coerce_int(value):
     if hasattr(value, "detach"):
         flat = value.detach().cpu().reshape(-1)
