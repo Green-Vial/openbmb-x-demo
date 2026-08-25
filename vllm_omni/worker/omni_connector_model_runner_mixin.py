@@ -101,6 +101,27 @@ class OmniConnectorModelRunnerMixin:
 
         self._async_chunk: bool = getattr(model_config, "async_chunk", False)
         self._model_mode: str = getattr(model_config, "worker_type", "ar")
+        # B4 (parameter-level): make the stage connector polling interval a
+        # real knob consumed by the recv/save loops instead of a dead YAML
+        # value.  Source of truth (highest wins):
+        #   OMNI_CONNECTOR_POLL_SLEEP_S env  ->  stage_connector_config.extra.connector_get_sleep_s  -> 0.001
+        # The configured YAML value (0.01) is clamped to <= 0.002 so the
+        # official deploy config cannot regress the polling cadence.
+        _poll_sleep = 0.001
+        try:
+            _poll_sleep = float(os.environ.get("OMNI_CONNECTOR_POLL_SLEEP_S", _poll_sleep))
+        except (TypeError, ValueError):
+            pass
+        try:
+            _cc = getattr(model_config, "stage_connector_config", None)
+            if isinstance(_cc, dict):
+                _extra = _cc.get("extra")
+                if isinstance(_extra, dict):
+                    _cfg_sleep = float(_extra.get("connector_get_sleep_s", _poll_sleep))
+                    _poll_sleep = min(_cfg_sleep, _poll_sleep)
+        except (TypeError, ValueError):
+            pass
+        self._connector_poll_sleep_s: float = max(0.0001, _poll_sleep)
         stage_id = getattr(model_config, "stage_id", 0)
         if isinstance(stage_id, str):
             stage_id = int(stage_id)
@@ -1622,7 +1643,7 @@ class OmniConnectorModelRunnerMixin:
                 pending_ids = list(self._pending_load_reqs.keys())
 
             if not pending_ids:
-                self._work_available.wait(timeout=0.01)
+                self._work_available.wait(timeout=self._connector_poll_sleep_s)
                 self._work_available.clear()
                 continue
 
@@ -1646,7 +1667,7 @@ class OmniConnectorModelRunnerMixin:
                     logger.warning("Error receiving data for %s", req_id, exc_info=True)
 
             if not made_progress and not self._stop_event.is_set():
-                self._work_available.wait(timeout=0.005)
+                self._work_available.wait(timeout=self._connector_poll_sleep_s)
                 self._work_available.clear()
 
     _MAX_SEND_RETRIES = 3
@@ -1679,7 +1700,7 @@ class OmniConnectorModelRunnerMixin:
                     self._requeue_or_drop_failed_send(task)
                 continue
 
-            self._work_available.wait(timeout=0.01)
+            self._work_available.wait(timeout=self._connector_poll_sleep_s)
             self._work_available.clear()
 
     def _requeue_or_drop_failed_send(self, task: dict) -> None:

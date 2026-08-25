@@ -9,7 +9,9 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
-      connector_get_sleep_s: 0.01
+      # B4 (parameter-level): consumed by OmniConnectorModelRunnerMixin recv/save
+      # loops (see _connector_poll_sleep_s). 0.001 = 1ms polling cadence.
+      connector_get_sleep_s: 0.001
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
       codec_chunk_frames: 25
