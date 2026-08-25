@@ -213,6 +213,34 @@ def _attach_videomme_to_request_func_input(sample: SampleRequest, rfi: RequestFu
         setattr(rfi, "mm_position", sample.omni_chat_mm_position)
 
 
+def _maybe_save_seed_tts_pcm(rfi: RequestFuncInput, pcm_bytes: bytes) -> None:
+    """Save Seed-TTS synthesized PCM to disk at request time (TTS stage).
+
+    This makes audio available even if the WER/SIM eval stage later crashes or
+    is interrupted, so ``eval_only_seedtts.py`` can recompute metrics offline.
+    Controlled by ``SEED_TTS_WER_SAVE_AUDIO_DIR`` (set in bench_seedtts_official.sh).
+    """
+    out_dir = os.environ.get("SEED_TTS_WER_SAVE_AUDIO_DIR", "").strip()
+    if not out_dir or not pcm_bytes:
+        return
+    if not getattr(rfi, "seed_tts_row", False):
+        return
+    uid = ""
+    locale = "zh"
+    turns = getattr(rfi, "seed_tts_turns", None)
+    if turns:
+        first = turns[0]
+        uid = getattr(first, "utterance_id", "") or ""
+        locale = getattr(first, "locale", "") or "zh"
+    safe_uid = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in str(uid)).strip("._") or "item"
+    d = Path(out_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        (d / f"{safe_uid}__{locale}.pcm").write_bytes(pcm_bytes)
+    except OSError as ex:
+        logger.warning("Seed-TTS PCM save failed: %s", ex)
+
+
 def _attach_seed_tts_to_request_func_input(sample: SampleRequest, rfi: RequestFuncInput) -> None:
     """Merge Seed-TTS per-row TTS fields into ``extra_body`` and mark for PCM capture.
 
@@ -1166,7 +1194,7 @@ async def async_request_openai_chat_omni_completions(
                         output.audio_rtf = defs.compute_audio_rtf(audio_generate_time, audio_duration)
                         if audio_duration <= 0:
                             logger.warning("Audio duration is zero")
-                        if _seed_tts_capture_pcm_for_wer() and getattr(request_func_input, "seed_tts_row", False):
+                        if (_seed_tts_capture_pcm_for_wer() or os.environ.get("SEED_TTS_WER_SAVE_AUDIO_DIR", "").strip()) and getattr(request_func_input, "seed_tts_row", False):
                             try:
                                 if response_format == "wav" and wav_pcm_buffer and wav_audio_params is not None:
                                     from vllm.multimodal.audio import AudioResampler
@@ -1193,6 +1221,8 @@ async def async_request_openai_chat_omni_completions(
                                     output.tts_output_pcm_bytes = (waveform * 32767).astype(np.int16).tobytes()
                             except Exception as ex:
                                 logger.warning("seed_tts WER PCM export failed: %s", ex)
+                            if output.tts_output_pcm_bytes:
+                                _maybe_save_seed_tts_pcm(request_func_input, output.tts_output_pcm_bytes)
                     output.success = True
                 else:
                     await _record_http_error(output, response, "openai-chat-omni")
@@ -1380,7 +1410,10 @@ async def async_request_openai_audio_speech(
     }
     _update_payload_common(payload, request_func_input)
     # Seed-TTS + WER: ``--extra-body`` may set stream=false / other formats; speech must stream PCM.
-    if getattr(request_func_input, "seed_tts_row", False) and _seed_tts_capture_pcm_for_wer():
+    # PCM capture also enabled when SEED_TTS_WER_SAVE_AUDIO_DIR is set (two-stage: generate-only then NPU eval).
+    if getattr(request_func_input, "seed_tts_row", False) and (
+        _seed_tts_capture_pcm_for_wer() or os.environ.get("SEED_TTS_WER_SAVE_AUDIO_DIR", "").strip()
+    ):
         payload["stream"] = True
         payload["stream_format"] = "audio"
         payload["response_format"] = "pcm"
@@ -1401,7 +1434,9 @@ async def async_request_openai_audio_speech(
     st = time.perf_counter()
     output.start_time = st
     total_pcm_bytes = 0
-    capture_wer_pcm = _seed_tts_capture_pcm_for_wer() and getattr(request_func_input, "seed_tts_row", False)
+    capture_wer_pcm = (
+        _seed_tts_capture_pcm_for_wer() or os.environ.get("SEED_TTS_WER_SAVE_AUDIO_DIR", "").strip()
+    ) and getattr(request_func_input, "seed_tts_row", False)
     pcm_capture = bytearray() if capture_wer_pcm else None
     chunk_arrival_times_s: list[float] = []
     chunk_sizes: list[int] = []
@@ -1459,6 +1494,7 @@ async def async_request_openai_audio_speech(
                     except Exception as ex:
                         logger.warning("Seed-TTS WER PCM normalization failed: %s", ex)
                         output.tts_output_pcm_bytes = bytes(pcm_capture)
+                    _maybe_save_seed_tts_pcm(request_func_input, output.tts_output_pcm_bytes)
                 elif capture_wer_pcm:
                     ct = response.headers.get("Content-Type", "")
                     logger.warning(
