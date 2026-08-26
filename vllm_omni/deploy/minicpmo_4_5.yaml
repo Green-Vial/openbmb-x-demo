@@ -97,8 +97,10 @@ platforms:
       - stage_id: 0
         max_num_batched_tokens: 8192
         compilation_config:
-          cudagraph_mode: PIECEWISE
+          # P5 (graph bubble): decode -> FULL (one whole-step graph, no
+          # per-layer attention in/out-of-graph gaps), prefill/mixed -> PIECEWISE.
+          cudagraph_mode: FULL_AND_PIECEWISE
       - stage_id: 1
         max_num_batched_tokens: 8192
         compilation_config:
-          cudagraph_mode: PIECEWISE
+          cudagraph_mode: FULL_AND_PIECEWISE
