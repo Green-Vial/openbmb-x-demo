@@ -65,6 +65,23 @@ def _restore_weight_norm_weight(weight_g: torch.Tensor, weight_v: torch.Tensor) 
     return torch._weight_norm(weight_v, weight_g, dim=0)
 
 
+_PENALTY_BASE_CACHE: dict[tuple[str, torch.dtype], torch.Tensor] = {}
+
+
+def _penalty_base(penalty: float, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Device-resident penalty scalar, cached per (device, dtype).
+
+    ``torch.as_tensor(penalty, device=...)`` issues a host->device copy on
+    every decode step; the cached scalar is identical and copy-free.
+    """
+    key = (str(device), dtype)
+    cached = _PENALTY_BASE_CACHE.get(key)
+    if cached is None:
+        cached = torch.tensor(penalty, device=device, dtype=dtype)
+        _PENALTY_BASE_CACHE[key] = cached
+    return cached
+
+
 def _apply_repetition_penalty(
     logits: torch.Tensor,
     history: torch.Tensor,
@@ -76,8 +93,14 @@ def _apply_repetition_penalty(
     if penalty == 1.0 or history.numel() == 0:
         return logits
     recent = history.reshape(-1)[-window_size:].to(device=logits.device, dtype=torch.long)
-    frequencies = torch.bincount(recent, minlength=logits.shape[-1]).to(dtype=logits.dtype)
-    alpha = torch.pow(torch.as_tensor(penalty, device=logits.device, dtype=logits.dtype), frequencies)
+    # torch.bincount must read max(recent) back to the host to size its
+    # output, inserting a device synchronization into every decode step.
+    # A scatter_add into a full-vocab buffer yields the identical integer
+    # counts with a statically known shape, so the kernel-submission
+    # pipeline stays fully asynchronous.
+    frequencies = torch.zeros(logits.shape[-1], device=logits.device, dtype=torch.long)
+    frequencies.scatter_add_(0, recent, torch.ones_like(recent))
+    alpha = torch.pow(_penalty_base(penalty, logits.device, logits.dtype), frequencies.to(dtype=logits.dtype))
     return torch.where(logits < 0, logits * alpha, logits / alpha)
 
 
