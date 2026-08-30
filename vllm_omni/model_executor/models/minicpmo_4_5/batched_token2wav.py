@@ -785,7 +785,12 @@ class BatchedToken2Wav(nn.Module):
         key = (batch, width)
         bucket = self._hift_graphs.get(key, _MISSING)
         if bucket is _MISSING:
-            if len(self._hift_graphs) >= _CFM_GRAPH_MAX_ENTRIES:
+            # Only the first two widths are worth a graph: the first chunk of
+            # a stream (TTFP path) and the steady-state width. Tail chunks
+            # have per-request widths (pending*2 at flush) — capturing each
+            # one burned capture time and graph memory for a single future
+            # use, which measurably regressed RTF (12 graphs per bench run).
+            if len(self._hift_graphs) >= 2:
                 self._hift_graphs[key] = None
                 return None
             bucket = self._capture_hift_graph(batch, width, mel)
