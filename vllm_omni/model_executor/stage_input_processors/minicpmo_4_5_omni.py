@@ -35,6 +35,7 @@ class _MiniCPMO45MetaStruct(MetaStruct):
     segment_end: bool | None = None
     turn_end: bool | None = None
     tts_is_last_chunk: bool | None = None
+    tts_setup_marker: bool | None = None
 
 
 def _extract_first_audio_ref(multi_modal_data):
@@ -265,6 +266,21 @@ def _is_aborted(request: Any) -> bool:
     return any(marker in status_name for marker in ("ABORT", "CANCEL", "IGNORED", "ERROR"))
 
 
+def _extract_ref_audio(request: Any) -> tuple[torch.Tensor | None, int | None]:
+    """Reference audio attached to the request by the upstream processor."""
+    request_info = getattr(request, "additional_information", None)
+    if not isinstance(request_info, Mapping):
+        return None, None
+    codes_info = request_info.get("codes")
+    meta_info = request_info.get("meta")
+    raw_ref_audio = codes_info.get("ref") if isinstance(codes_info, Mapping) else None
+    raw_ref_audio_sr = meta_info.get("ref_audio_sr") if isinstance(meta_info, Mapping) else None
+    ref_audio_sr = _coerce_int(raw_ref_audio_sr)
+    if raw_ref_audio is None:
+        return None, ref_audio_sr
+    return torch.as_tensor(raw_ref_audio, dtype=torch.float32).reshape(-1).cpu(), ref_audio_sr
+
+
 def tts2code2wav_async_chunk(
     transfer_manager: Any,
     multimodal_output: Any,
@@ -355,6 +371,50 @@ def tts2code2wav_async_chunk(
     flush_pending = finished
     last_chunk = bool(flush_pending and (not native_duplex or turn_end))
     if not flush_pending and len(pending) < chunk_frames:
+        # P13: on the first talker decode step of a non-duplex stream (before
+        # the first full codec chunk exists), forward the reference audio to
+        # Code2Wav as a zero-length setup marker. Stage 2 then runs
+        # prepare_prompt + setup_batch while the talker still generates the
+        # remaining codec codes, hiding the prompt CFM warmup from TTFP.
+        # The single placeholder code keeps the payload consumable (it wakes
+        # the stage-2 scheduler); code_flat_numel=0 tells Code2Wav to discard
+        # it, exactly like the duplex short-unit marker.
+        if (
+            not native_duplex
+            and pending
+            and int(record["cache_epoch"]) == 0
+            and int(record["chunk_seq"]) == 0
+        ):
+            marker_ref, marker_ref_sr = _extract_ref_audio(request)
+            if marker_ref is not None:
+                record["chunk_seq"] = 1
+                false_tensor = torch.tensor(False, dtype=torch.bool)
+                return OmniPayloadStruct(
+                    codes=CodesStruct(
+                        audio=torch.zeros(1, dtype=torch.long),
+                        ref=marker_ref,
+                    ),
+                    meta=_MiniCPMO45MetaStruct(
+                        request_id=request_id,
+                        chunk_seq=0,
+                        cache_epoch=0,
+                        code_flat_numel=0,
+                        codec_chunk_frames=0,
+                        codec_left_context_frames=0,
+                        left_context_size=0,
+                        last_chunk=False,
+                        stream_finished=false_tensor,
+                        finished=false_tensor,
+                        is_segment_finished=false_tensor,
+                        req_id=[request_id],
+                        duplex_epoch=duplex_epoch,
+                        duplex_turn_id=duplex_turn_id,
+                        tts_is_last_chunk=False,
+                        ref_audio_sr=marker_ref_sr,
+                        tts_setup_marker=True,
+                    ),
+                    request_id=request_id,
+                )
         return None
 
     hold_short_unit = (
@@ -402,15 +462,7 @@ def tts2code2wav_async_chunk(
     ref_audio = None
     ref_audio_sr = None
     if int(record["cache_epoch"]) == 0 and chunk_seq == 0:
-        request_info = getattr(request, "additional_information", None)
-        if isinstance(request_info, Mapping):
-            codes_info = request_info.get("codes")
-            meta_info = request_info.get("meta")
-            raw_ref_audio = codes_info.get("ref") if isinstance(codes_info, Mapping) else None
-            raw_ref_audio_sr = meta_info.get("ref_audio_sr") if isinstance(meta_info, Mapping) else None
-            ref_audio_sr = _coerce_int(raw_ref_audio_sr)
-            if raw_ref_audio is not None:
-                ref_audio = torch.as_tensor(raw_ref_audio, dtype=torch.float32).reshape(-1).cpu()
+        ref_audio, ref_audio_sr = _extract_ref_audio(request)
     finished_tensor = torch.tensor(last_chunk, dtype=torch.bool)
     payload = OmniPayloadStruct(
         codes=CodesStruct(

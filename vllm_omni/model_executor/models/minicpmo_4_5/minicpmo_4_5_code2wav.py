@@ -104,6 +104,7 @@ class _WorkItem:
     segment_end: bool
     turn_end: bool
     has_payload: bool = True
+    setup_marker: bool = False
 
 
 class MiniCPMO45Code2Wav(nn.Module):
@@ -400,6 +401,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             )
         last_chunk = bool(_scalar(meta.get("last_chunk"), False))
         tts_is_last_chunk = bool(_scalar(meta.get("tts_is_last_chunk"), False))
+        setup_marker = bool(_scalar(meta.get("tts_setup_marker"), False))
         codes = info.get("codes")
         audio = codes.get("audio") if isinstance(codes, Mapping) else None
         tokens = _codec_tensor(audio, segment)
@@ -410,6 +412,31 @@ class MiniCPMO45Code2Wav(nn.Module):
             # placeholder as codec data.
             tokens = segment.new_empty(0, dtype=torch.long)
         previous = self._states.get(state_id)
+        if setup_marker and previous is not None:
+            # P13: a stale early-setup marker (the request state was already
+            # established, e.g. by an earlier marker or by the first real
+            # chunk racing ahead) is a no-op.
+            return _WorkItem(
+                output_index=index,
+                state_id=state_id,
+                request_id=request_id,
+                cache_epoch=previous.cache_epoch,
+                chunk_seq=previous.chunk_seq,
+                prompt_cache_id=previous.prompt_cache_id,
+                prompt_wav=previous.prompt_wav,
+                last_chunk=False,
+                tokens=segment.new_empty(0, dtype=torch.long),
+                previous=previous,
+                runtime_prompt_key=self._request_prompt_keys.get(state_id),
+                duplex_epoch=-1,
+                duplex_turn_id=-1,
+                segment_text_utf8=torch.empty(0, dtype=torch.uint8),
+                tts_is_last_chunk=False,
+                segment_end=False,
+                turn_end=False,
+                has_payload=False,
+                setup_marker=False,
+            )
         if previous is None:
             if chunk_seq != 0:
                 raise _batch_error(
@@ -482,6 +509,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             tts_is_last_chunk=tts_is_last_chunk,
             segment_end=bool(_scalar(meta.get("segment_end"), False)),
             turn_end=bool(_scalar(meta.get("turn_end"), False)),
+            setup_marker=setup_marker,
         )
 
     @staticmethod
@@ -585,11 +613,19 @@ class MiniCPMO45Code2Wav(nn.Module):
         segment_markers = [
             item for item in items if not item.last_chunk and item.tts_is_last_chunk and item.tokens.numel() == 0
         ]
+        # P13: zero-length early-setup markers sent by the Talker on its first
+        # decode step; they carry only the reference audio and establish the
+        # per-request flow caches ahead of the first real codec chunk.
+        setup_markers = [item for item in items if item.setup_marker and item.tokens.numel() == 0]
         compute_items = [item for item in items if item.tokens.numel() > 0]
         invalid_empty = [
             item.request_id
             for item in items
-            if item.has_payload and not item.last_chunk and not item.tts_is_last_chunk and item.tokens.numel() == 0
+            if item.has_payload
+            and not item.last_chunk
+            and not item.tts_is_last_chunk
+            and not item.setup_marker
+            and item.tokens.numel() == 0
         ]
         if invalid_empty:
             self._prune_unowned_runtime_prompts()
@@ -630,7 +666,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             }
         )
         initial_marker_buckets: dict[tuple[str, str], list[_WorkItem]] = {}
-        for item in segment_markers:
+        for item in (*segment_markers, *setup_markers):
             if item.previous is None:
                 initial_marker_buckets.setdefault(
                     (item.prompt_cache_id, item.prompt_wav),
