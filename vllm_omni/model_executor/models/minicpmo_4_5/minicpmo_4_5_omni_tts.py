@@ -159,6 +159,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._request_generators: dict[str, torch.Generator] = {}
         self._request_audio_states: dict[str, dict[str, Any]] = {}
         self._deferred_cleanup_ids: set[str] = set()
+        # P12b: (device, dtype) -> (continue_row, stop_row) device templates.
+        self._stop_row_templates: dict[tuple[torch.device, torch.dtype], tuple[torch.Tensor, torch.Tensor]] = {}
 
         tts_config = getattr(config, "tts_config", None)
         if tts_config is None and getattr(config, "model_type", None) == "minicpmtts":
@@ -428,6 +430,23 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             generator=self._request_generator(request_id, probabilities.device),
         ).reshape(())
 
+    def _stop_row_templates_for(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Device-resident (continue_row, stop_row) logit templates.
+
+        ``hidden.new_tensor([...])`` copies two floats host->device on every
+        decode step; the cached rows are bit-identical, allocation-free, and
+        only ever read (torch.stack copies them into the batch tensor).
+        """
+        key = (hidden.device, hidden.dtype)
+        cached = self._stop_row_templates.get(key)
+        if cached is None:
+            cached = (
+                hidden.new_tensor([0.0, float("-inf")]),
+                hidden.new_tensor([float("-inf"), 0.0]),
+            )
+            self._stop_row_templates[key] = cached
+        return cached
+
     def make_omni_output(
         self,
         model_outputs: torch.Tensor | OmniOutput,
@@ -458,6 +477,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         segment_texts_utf8: list[torch.Tensor] = []
         turn_end_flags: list[torch.Tensor] = []
         empty_delta = hidden.new_empty((0, 1), dtype=torch.long)
+        # P12b: device-resident templates, cached per (device, dtype).
+        continue_row, stop_row_template = self._stop_row_templates_for(hidden)
         for index, info in enumerate(infos):
             info_dict = info if isinstance(info, dict) else {}
             native_duplex = info_dict.get("native_duplex") is True
@@ -503,14 +524,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 turn_end_flags.append(torch.tensor(native_duplex and contains_turn_eos, dtype=torch.bool))
 
             if not isinstance(info, dict):
-                stop_rows.append(hidden.new_tensor([0.0, float("-inf")]))
+                stop_rows.append(continue_row)
                 codec_deltas.append(empty_delta)
                 terminal_flags.append(torch.tensor(False, dtype=torch.bool))
                 continue
             start, end = spans[index]
             end = min(int(end), int(hidden.shape[0]))
             if int(start) >= end:
-                stop_rows.append(hidden.new_tensor([0.0, float("-inf")]))
+                stop_rows.append(continue_row)
                 codec_deltas.append(empty_delta)
                 terminal_flags.append(torch.tensor(False, dtype=torch.bool))
                 continue
@@ -524,7 +545,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 state = dict(info.get("audio_state", {}) or {})
                 request_states[request_id] = state
             if state.get("finished"):
-                stop_rows.append(hidden.new_tensor([float("-inf"), 0.0]))
+                stop_rows.append(stop_row_template)
                 codec_deltas.append(empty_delta)
                 terminal_flags.append(torch.tensor(False, dtype=torch.bool))
                 continue
@@ -532,7 +553,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 # vLLM computes a logit row for incomplete chunked prefills but
                 # discards its sampled token. Advancing codec/RNG state here
                 # would make output depend on prefill chunking and compaction.
-                stop_rows.append(hidden.new_tensor([0.0, float("-inf")]))
+                stop_rows.append(continue_row)
                 codec_deltas.append(empty_delta)
                 terminal_flags.append(torch.tensor(False, dtype=torch.bool))
                 continue
@@ -566,7 +587,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             }
             codec_deltas.append(delta)
             terminal_flags.append(torch.tensor(finished, dtype=torch.bool))
-            stop_rows.append(hidden.new_tensor([float("-inf"), 0.0] if finished else [0.0, float("-inf")]))
+            stop_rows.append(stop_row_template if finished else continue_row)
 
         self._batch_stop_logits = torch.stack(stop_rows, dim=0) if stop_rows else hidden.new_empty((0, 2))
         # Lists are deliberate: the runner routes element i to request i,
