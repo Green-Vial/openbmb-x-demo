@@ -181,5 +181,13 @@ def apply_step_audio2_token2wav_npu_patch() -> None:
     StepAudio2Token2WavCore.forward = _patched_forward  # type: ignore[method-assign]
     StepAudio2Token2WavCore.stream_chunk_for = _patched_stream_chunk_for  # type: ignore[method-assign]
 
+    # vllm-ascend's runner sets allow_internal_format=True process-wide, which
+    # routes Conv2D through the legacy aclop path; aclop ops are illegal
+    # inside NPU graph capture ("Cannot run aclop operators during NPU graph
+    # capture ... Current working aclop is Conv2D"). The Qwen3-TTS Code2Wav
+    # NPU patch already flips this back to False for the generation stage;
+    # do the same here (the stage-2 process only ever runs Token2Wav).
+    torch.npu.config.allow_internal_format = False
+
     _PATCHED = True
     logger.debug("Applied NPU patch for StepAudio2Token2WavCore")
