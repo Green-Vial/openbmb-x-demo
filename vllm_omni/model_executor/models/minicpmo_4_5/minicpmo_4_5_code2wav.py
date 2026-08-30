@@ -847,5 +847,9 @@ class MiniCPMO45Code2Wav(nn.Module):
             )
         finally:
             torch.set_default_dtype(previous_dtype)
-        self.backend = BatchedToken2Wav(token2wav)
+        # P15: capture the CFM decode loop in an NPU graph (per padded
+        # att-cache bucket). Removes ~2700 kernel launches per chunk.
+        # Disable via extra key "code2wav_cfm_graph": off/false/0/no.
+        cfm_graph = str(extra.get("code2wav_cfm_graph", "auto")).lower() not in ("0", "false", "off", "no")
+        self.backend = BatchedToken2Wav(token2wav, cfm_graph=cfm_graph)
         self._warmup_code2wav()

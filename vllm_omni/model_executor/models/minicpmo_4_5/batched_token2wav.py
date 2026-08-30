@@ -18,6 +18,38 @@ logger = init_logger(__name__)
 
 _SILENCE_TOKEN = 4218
 
+# P15: NPU graph capture of the CFM decode loop. The estimator launch storm
+# (~900 small kernels per CFM step, 3 steps per chunk) is pure host overhead
+# on a shared accelerator. att-cache lengths grow per chunk and vary per
+# request, so graphs are bucketed by padded cache length (upstream cosyvoice
+# uses the same padding+mask trick for its CUDA-graph path).
+_CFM_GRAPH_ATT_GRAIN = 128
+_CFM_GRAPH_ATT_MAX = 768
+_CFM_GRAPH_MAX_ENTRIES = 12
+_MISSING = object()
+
+
+class _CFMGraphBucket:
+    """Static buffers + captured NPUGraph for one (batch, width, att_bucket)."""
+
+    __slots__ = (
+        "graph",
+        "x_in",
+        "mu_in",
+        "spk_in",
+        "cond_in",
+        "cnn_in",
+        "att_in",
+        "mask",
+        "out_x",
+        "out_cnn",
+        "out_att",
+        "t_embs",
+        "dts",
+        "width",
+        "att_bucket",
+    )
+
 
 def _autocast_disabled(device: torch.device):
     """Disable any enclosing autocast region on ``device``.
@@ -64,7 +96,7 @@ class BatchedToken2Wav(nn.Module):
     asset loader and prompt feature extractor.
     """
 
-    def __init__(self, token2wav: Any):
+    def __init__(self, token2wav: Any, cfm_graph: bool = True):
         super().__init__()
         self._token2wav = token2wav
         self.flow = token2wav.flow
@@ -108,6 +140,12 @@ class BatchedToken2Wav(nn.Module):
             persistent=False,
         )
         self._prompt_features: dict[tuple[str, str], PromptFeatures] = {}
+        # P15: NPU graph capture of the CFM decode loop (see _decode_cfm_graphed).
+        self._cfm_graph_enabled = bool(cfm_graph)
+        self._cfm_graphs: dict[tuple[int, int, int], _CFMGraphBucket | None] = {}
+        self._cfm_graph_pool: Any = None
+        self._cfm_graph_dead = False
+        self._cfm_modal_width: int | None = None
 
     def prepare_prompt(self, prompt_cache_id: str, prompt_wav: str) -> PromptFeatures:
         cache_key = (prompt_cache_id, prompt_wav)
@@ -211,8 +249,11 @@ class BatchedToken2Wav(nn.Module):
         cond: torch.Tensor,
         cnn_cache: torch.Tensor | None,
         att_cache: torch.Tensor | None,
+        mask: torch.Tensor | None = None,
+        time_embedding: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        time_embedding = estimator.t_embedder(time).unsqueeze(1)
+        if time_embedding is None:
+            time_embedding = estimator.t_embedder(time).unsqueeze(1)
         width = int(x.shape[-1])
         speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)
         estimator_input = torch.cat((x, mu, speaker_features, cond), dim=1)
@@ -222,13 +263,214 @@ class BatchedToken2Wav(nn.Module):
         result = estimator.blocks_forward_chunk(
             estimator_input,
             time_embedding,
-            None,
+            mask,
             old_cnn,
             old_att,
             cnn_out,
             att_out,
         )
         return result, cnn_out, att_out
+
+    def _cfm_graph_constants(self, batch: int, device: torch.device, dtype: torch.dtype):
+        """Per-model constants of the CFM loop, computed eagerly once.
+
+        ``batch`` is the request batch N; the returned timestep embeddings
+        carry the CFG-doubled batch 2N (matching the eager path, which feeds
+        ``cat((time, time))`` through the embedder).
+
+        The timestep embedder creates its frequency table on CPU and copies
+        it to device, which is illegal inside a graph capture; the timeline
+        and per-step dt are also pure constants. Precompute them (identical
+        values to the eager path's per-chunk recomputation).
+        """
+        decoder = self.flow.decoder
+        estimator = decoder.estimator
+        timeline = torch.linspace(0, 1, self.n_timesteps + 1, device=device, dtype=dtype)
+        timeline = 1 - torch.cos(timeline * 0.5 * torch.pi)
+        time = timeline[0].expand(batch)
+        t_embs: list[torch.Tensor] = []
+        dts: list[torch.Tensor] = []
+        dt = timeline[1] - timeline[0]
+        for step in range(self.n_timesteps):
+            t_embs.append(
+                estimator.t_embedder(torch.cat((time, time), dim=0)).unsqueeze(1).detach().clone()
+            )
+            dts.append(dt.detach().clone())
+            time = time + dt
+            if step + 1 < self.n_timesteps:
+                dt = timeline[step + 2] - time[0]
+        return t_embs, dts
+
+    def _run_cfm_loop(
+        self,
+        x: torch.Tensor,
+        mu: torch.Tensor,
+        speakers: torch.Tensor,
+        cond: torch.Tensor,
+        cnn_in: torch.Tensor,
+        att_in: torch.Tensor,
+        mask: torch.Tensor | None,
+        t_embs: list[torch.Tensor],
+        dts: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The CFM integration loop shared by the eager and captured paths.
+
+        Mirrors the original _decode_cfm body, except that the timestep
+        embeddings / dt scalars are precomputed constants (capture-safe) and
+        the attention mask (``None`` in the eager path) can exclude padded
+        att-cache columns in the graph path.
+        """
+        decoder = self.flow.decoder
+        estimator = decoder.estimator
+        batch_size = int(mu.shape[0])
+        mu_cfg = torch.cat((mu, torch.zeros_like(mu)), dim=0)
+        speakers_cfg = torch.cat((speakers, torch.zeros_like(speakers)), dim=0)
+        cond_cfg = torch.cat((cond, torch.zeros_like(cond)), dim=0)
+        next_cnn: list[torch.Tensor] = []
+        next_att: list[torch.Tensor] = []
+        for step in range(self.n_timesteps):
+            estimate, step_cnn, step_att = self._estimator_step(
+                estimator,
+                x=torch.cat((x, x), dim=0),
+                mu=mu_cfg,
+                time=torch.zeros(0, device=mu.device, dtype=mu.dtype),
+                speakers=speakers_cfg,
+                cond=cond_cfg,
+                cnn_cache=cnn_in[step],
+                att_cache=att_in[step],
+                mask=mask,
+                time_embedding=t_embs[step],
+            )
+            conditional, unconditional = estimate.split(batch_size, dim=0)
+            velocity = (1.0 + decoder.inference_cfg_rate) * conditional - decoder.inference_cfg_rate * unconditional
+            x = x + dts[step] * velocity
+            next_cnn.append(step_cnn)
+            next_att.append(step_att)
+        return x, torch.stack(next_cnn), torch.stack(next_att)
+
+    def _capture_cfm_graph(
+        self,
+        batch: int,
+        width: int,
+        att_bucket: int,
+        mu: torch.Tensor,
+        speakers: torch.Tensor,
+    ) -> _CFMGraphBucket | None:
+        """Capture one NPUGraph for (batch, width, att_bucket).
+
+        Returns None (and permanently disables the feature) when capture is
+        unsupported on this stack; callers then keep the eager path.
+        """
+        if self._cfm_graph_dead:
+            return None
+        device = mu.device
+        dtype = mu.dtype
+        n_steps = self.n_timesteps
+        decoder = self.flow.decoder
+        block0 = decoder.estimator.blocks[0]
+        depth = len(decoder.estimator.blocks)
+        heads = int(block0.attn.num_heads)
+        att_width = int(block0.attn.head_dim * 2)
+        cnn_channels = int(block0.conv.in_channels + block0.conv.out_channels)
+        cnn_width = int(block0.conv.block[1].causal_padding[0])
+        try:
+            b = _CFMGraphBucket()
+            b.width = width
+            b.att_bucket = att_bucket
+            mel_ch = int(decoder.rand_noise.shape[1])
+            b.x_in = torch.zeros((batch, mel_ch, width), dtype=dtype, device=device)
+            b.mu_in = torch.zeros_like(b.x_in)
+            b.cond_in = torch.zeros_like(b.x_in)
+            b.spk_in = torch.zeros((batch, speakers.shape[1]), dtype=dtype, device=device)
+            b.cnn_in = torch.zeros((n_steps, depth, 2 * batch, cnn_channels, cnn_width), dtype=dtype, device=device)
+            b.att_in = torch.zeros(
+                (n_steps, depth, 2 * batch, heads, att_bucket, att_width), dtype=dtype, device=device
+            )
+            b.mask = torch.ones((2 * batch, width, att_bucket + width), dtype=torch.bool, device=device)
+            if self._cfm_graph_pool is None:
+                self._cfm_graph_pool = torch.npu.graph_pool_handle()
+            # Timestep embeddings / dt are per-model constants; compute them
+            # eagerly (the t_embedder does a host->device copy internally,
+            # which is illegal under capture). They are captured by address,
+            # so they MUST stay alive for the lifetime of the graph — park
+            # them on the bucket.
+            b.t_embs, b.dts = self._cfm_graph_constants(batch, device, dtype)
+            t_embs, dts = b.t_embs, b.dts
+            # Warmup on the static buffers (side-effect free; allocator settles).
+            with torch.no_grad():
+                self._run_cfm_loop(
+                    b.x_in, b.mu_in, b.spk_in, b.cond_in, b.cnn_in, b.att_in, b.mask, t_embs, dts
+                )
+            torch.npu.synchronize()
+            graph = torch.npu.NPUGraph()
+            with torch.npu.graph(graph, pool=self._cfm_graph_pool):
+                b.out_x, b.out_cnn, b.out_att = self._run_cfm_loop(
+                    b.x_in, b.mu_in, b.spk_in, b.cond_in, b.cnn_in, b.att_in, b.mask, t_embs, dts
+                )
+            b.graph = graph
+            torch.npu.synchronize()
+            logger.info(
+                "CFM graph captured: batch=%d width=%d att_bucket=%d steps=%d",
+                batch,
+                width,
+                att_bucket,
+                n_steps,
+            )
+            return b
+        except Exception:
+            logger.exception("CFM graph capture failed; falling back to eager permanently")
+            self._cfm_graph_dead = True
+            return None
+
+    def _decode_cfm_graphed(
+        self,
+        mu: torch.Tensor,
+        speakers: torch.Tensor,
+        cond: torch.Tensor,
+        cnn_cache: torch.Tensor,
+        att_cache: torch.Tensor,
+        offset: int,
+        end: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Graph-replay counterpart of the eager _decode_cfm body."""
+        batch = int(mu.shape[0])
+        width = int(mu.shape[2])
+        att_len = int(att_cache.shape[4])
+        att_bucket = ((att_len + _CFM_GRAPH_ATT_GRAIN - 1) // _CFM_GRAPH_ATT_GRAIN) * _CFM_GRAPH_ATT_GRAIN
+        if att_bucket > _CFM_GRAPH_ATT_MAX:
+            return None
+        # Only the modal (standard full-chunk) width is worth a graph; tail
+        # chunks have per-request widths and stay eager.
+        if self._cfm_modal_width is None:
+            self._cfm_modal_width = width
+        elif width != self._cfm_modal_width:
+            return None
+        key = (batch, width, att_bucket)
+        bucket = self._cfm_graphs.get(key, _MISSING)
+        if bucket is _MISSING:
+            if len(self._cfm_graphs) >= _CFM_GRAPH_MAX_ENTRIES:
+                self._cfm_graphs[key] = None
+                return None
+            bucket = self._capture_cfm_graph(batch, width, att_bucket, mu, speakers)
+            self._cfm_graphs[key] = bucket
+        if bucket is None:
+            return None
+        decoder = self.flow.decoder
+        x = decoder.rand_noise[:, :, offset:end].expand(batch, -1, -1).clone()
+        bucket.x_in.copy_(x)
+        bucket.mu_in.copy_(mu)
+        bucket.spk_in.copy_(speakers)
+        bucket.cond_in.copy_(cond)
+        bucket.cnn_in.copy_(cnn_cache)
+        bucket.att_in[..., att_len:, :].zero_()
+        bucket.att_in[..., :att_len, :].copy_(att_cache)
+        bucket.mask.zero_()
+        bucket.mask[:, :, : att_len + width].fill_(True)
+        bucket.graph.replay()
+        out_x = bucket.out_x.clone()
+        out_cnn = bucket.out_cnn.clone()
+        out_att = bucket.out_att[..., : att_len + width, :].clone()
+        return out_x, out_cnn, out_att
 
     def _decode_cfm(
         self,
@@ -250,6 +492,15 @@ class BatchedToken2Wav(nn.Module):
                 f'{{"reason":"noise_capacity","required":{end},'
                 f'"available":{int(decoder.rand_noise.shape[2])}}}'
             )
+        if (
+            self._cfm_graph_enabled
+            and not self._cfm_graph_dead
+            and cnn_cache is not None
+            and att_cache is not None
+        ):
+            graphed = self._decode_cfm_graphed(mu, speakers, cond, cnn_cache, att_cache, offset, end)
+            if graphed is not None:
+                return graphed
         x = decoder.rand_noise[:, :, offset:end].expand(batch_size, -1, -1).clone()
         timeline = torch.linspace(
             0,
