@@ -51,6 +51,20 @@ class _CFMGraphBucket:
     )
 
 
+class _HiFTGraphBucket:
+    """Static buffers + captured NPUGraph for one (batch, mel_width)."""
+
+    __slots__ = (
+        "graph",
+        "mel_in",
+        "cache_in",
+        "out_mag",
+        "out_phase",
+        "out_src",
+        "width",
+    )
+
+
 def _autocast_disabled(device: torch.device):
     """Disable any enclosing autocast region on ``device``.
 
@@ -146,6 +160,15 @@ class BatchedToken2Wav(nn.Module):
         self._cfm_graph_pool: Any = None
         self._cfm_graph_dead = False
         self._cfm_modal_width: int | None = None
+        # P16: same treatment for the HiFT vocoder (everything up to the
+        # final torch.istft, which syncs on NPU and stays eager). The
+        # steady-state mel width is mel_cache_len + chunk frames; the first
+        # chunk of a stream is narrower and gets its own graph.
+        self._hift_graph_enabled = bool(cfm_graph)
+        self._hift_graphs: dict[tuple[int, int], _HiFTGraphBucket | None] = {}
+        self._hift_graph_dead = False
+        if self._hift_graph_enabled:
+            self._patch_hift_for_graph()
 
     def prepare_prompt(self, prompt_cache_id: str, prompt_wav: str) -> PromptFeatures:
         cache_key = (prompt_cache_id, prompt_wav)
@@ -389,6 +412,11 @@ class BatchedToken2Wav(nn.Module):
             b.mask = torch.ones((2 * batch, width, att_bucket + width), dtype=torch.bool, device=device)
             if self._cfm_graph_pool is None:
                 self._cfm_graph_pool = torch.npu.graph_pool_handle()
+            # NOTE: graphs here deliberately do NOT share one memory pool —
+            # sharing a pool across separately-captured graphs made the HiFT
+            # capture fail with "Not allow to synchronize captured-stream"
+            # on this stack (each graph gets its own pool instead; memory
+            # overhead is a few hundred MB per graph at these shapes).
             # Timestep embeddings / dt are per-model constants; compute them
             # eagerly (the t_embedder does a host->device copy internally,
             # which is illegal under capture). They are captured by address,
@@ -644,6 +672,140 @@ class BatchedToken2Wav(nn.Module):
             )
         return result
 
+    def _patch_hift_for_graph(self) -> None:
+        """Remove the per-call host constants that break NPU graph capture.
+
+        - hift.stft_window is created on CPU; _stft/_istft do
+          ``window.to(x.device)`` every call, which is a real H2D copy the
+          first time and a captured-graph killer. Move it once at setup.
+        - SineGen2.forward rebuilds ``torch.FloatTensor([[range(...)]])`` on
+          host and copies it to device every chunk; keep the same values in a
+          device-resident buffer.
+        """
+        if getattr(self, "_hift_patched_for_graph", False):
+            return
+        try:
+            self.hift.stft_window = self.hift.stft_window.to(self.speech_window.device)
+            sine_gen = self.hift.m_source.l_sin_gen
+            harmonics = torch.FloatTensor([[range(1, sine_gen.harmonic_num + 2)]]).to(
+                self.speech_window.device
+            )
+        except AttributeError as exc:
+            logger.exception("HiFT graph patch: unexpected module layout; disabling")
+            self._hift_graph_dead = True
+            raise AttributeError from exc
+
+        # Closure over the instance (SineGen2.forward is plain python; the
+        # harmonics row is the only per-call host constant it rebuilds).
+        def _forward_graph_safe(f0: torch.Tensor):
+            fn = torch.multiply(f0, harmonics)
+            sine_waves = sine_gen._f02sine(fn) * sine_gen.sine_amp
+            uv = sine_gen._f02uv(f0)
+            noise_amp = uv * sine_gen.noise_std + (1 - uv) * sine_gen.sine_amp / 3
+            noise = noise_amp * torch.randn_like(sine_waves)
+            return sine_waves * uv + noise, uv, noise
+
+        sine_gen.forward = _forward_graph_safe
+        self._hift_patched_for_graph = True
+
+    def _capture_hift_graph(self, batch: int, width: int, mel: torch.Tensor) -> _HiFTGraphBucket | None:
+        """Capture f0->source->cache-inject->stft->decode (no istft) for (batch, width)."""
+        if self._hift_graph_dead:
+            return None
+        try:
+            b = _HiFTGraphBucket()
+            b.width = width
+            device = mel.device
+            dtype = mel.dtype
+            mel_ch = int(mel.shape[1])
+            src_len = int(self.source_cache_len)
+            b.mel_in = torch.zeros((batch, mel_ch, width), dtype=dtype, device=device)
+            b.cache_in = torch.zeros((batch, 1, src_len), dtype=dtype, device=device)
+            hift = self.hift
+
+            def _run() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                f0 = hift.f0_predictor(b.mel_in)
+                s_up = hift.f0_upsamp(f0[:, None]).transpose(1, 2)
+                s_t, _, _ = hift.m_source(s_up)
+                s = s_t.transpose(1, 2).clone()
+                s[:, :, :src_len] = b.cache_in
+                s_stft_real, s_stft_imag = hift._stft(s.squeeze(1))
+                s_stft = torch.cat([s_stft_real, s_stft_imag], dim=1)
+                x = hift.conv_pre(b.mel_in)
+                for i in range(hift.num_upsamples):
+                    x = F.leaky_relu(x, hift.lrelu_slope)
+                    x = hift.ups[i](x)
+                    if i == hift.num_upsamples - 1:
+                        x = hift.reflection_pad(x)
+                    si = hift.source_downs[i](s_stft)
+                    si = hift.source_resblocks[i](si)
+                    x = x + si
+                    xs = None
+                    for j in range(hift.num_kernels):
+                        if xs is None:
+                            xs = hift.resblocks[i * hift.num_kernels + j](x)
+                        else:
+                            xs = xs + hift.resblocks[i * hift.num_kernels + j](x)
+                    x = xs / hift.num_kernels
+                x = F.leaky_relu(x)
+                x = hift.conv_post(x)
+                magnitude = torch.exp(x[:, : hift.istft_params["n_fft"] // 2 + 1, :])
+                phase = torch.sin(x[:, hift.istft_params["n_fft"] // 2 + 1 :, :])
+                return magnitude, phase, s
+
+            with torch.no_grad():
+                _run()  # allocator warmup on the static buffers
+            torch.npu.synchronize()
+            graph = torch.npu.NPUGraph()
+            with torch.npu.graph(graph):
+                b.out_mag, b.out_phase, b.out_src = _run()
+            b.graph = graph
+            torch.npu.synchronize()
+            logger.info("HiFT graph captured: batch=%d mel_width=%d", batch, width)
+            return b
+        except Exception:
+            logger.exception("HiFT graph capture failed; falling back to eager permanently")
+            self._hift_graph_dead = True
+            return None
+
+    def _hift_graphed(self, mel: torch.Tensor, old_source: torch.Tensor):
+        """Graph-replay counterpart of ``self.hift(mel, old_source)`` minus istft.
+
+        Returns (speech, source) with speech reconstructed by the eager istft
+        (0.7ms; torch.istft syncs internally and cannot be captured), or None
+        when the shape is not worth/graphable.
+        """
+        if self._hift_graph_dead:
+            return None
+        batch, width = int(mel.shape[0]), int(mel.shape[2])
+        if int(mel.shape[1]) != 80:
+            return None
+        if int(old_source.shape[-1]) != int(self.source_cache_len):
+            return None
+        key = (batch, width)
+        bucket = self._hift_graphs.get(key, _MISSING)
+        if bucket is _MISSING:
+            if len(self._hift_graphs) >= _CFM_GRAPH_MAX_ENTRIES:
+                self._hift_graphs[key] = None
+                return None
+            bucket = self._capture_hift_graph(batch, width, mel)
+            self._hift_graphs[key] = bucket
+        if bucket is None:
+            return None
+        bucket.mel_in.copy_(mel)
+        bucket.cache_in.copy_(old_source)
+        bucket.graph.replay()
+        magnitude = bucket.out_mag.clone()
+        phase = bucket.out_phase.clone()
+        source = bucket.out_src.clone()
+        speech = self.hift._istft(magnitude, phase)
+        # hift.decode() ends with clamp(±audio_limit); our capture stops
+        # before istft, so apply the same clamp here or overshoot samples
+        # poison the speech/source caches of later chunks.
+        limit = float(getattr(self.hift, "audio_limit", 1.0))
+        speech = torch.clamp(speech, -limit, limit)
+        return speech, source
+
     def decode_batch(
         self,
         tokens: torch.Tensor,
@@ -712,7 +874,13 @@ class BatchedToken2Wav(nn.Module):
         old_source = torch.cat([state.hift_cache["source"] for state in states], dim=0)
         old_speech = torch.cat([state.hift_cache["speech"] for state in states], dim=0)
         mel = torch.cat((old_mel, chunk_mel), dim=2)
-        speech, source = self.hift(mel, old_source)
+        # P16: HiFT vocoder minus istft as one NPUGraph replay; the eager
+        # fallback is the unmodified self.hift call.
+        graphed = self._hift_graphed(mel, old_source)
+        if graphed is not None:
+            speech, source = graphed
+        else:
+            speech, source = self.hift(mel, old_source)
         if old_speech.shape[-1] > 0:
             window = self.speech_window.to(device=speech.device, dtype=speech.dtype)
             speech = self._fade_in_out(speech, old_speech, window)
