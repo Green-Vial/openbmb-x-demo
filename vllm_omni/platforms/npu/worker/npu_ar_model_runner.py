@@ -142,6 +142,10 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             )
         self._downstream_payload_cache: dict[str, bool] = {}
         self._init_duplex_sampling_state()
+        # [Omni] P24: runner-local K-window decode.  Holds the fully built
+        # OmniModelRunnerOutput between execute_model() and sample_tokens()
+        # when a window ran; see _lz_window_plan / _execute_lz_window.
+        self._lz_window_pending_output: OmniModelRunnerOutput | None = None
 
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
@@ -455,6 +459,20 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             kv_connector_metadata = scheduler_output.kv_connector_metadata
             if kv_connector_metadata is not None:
                 get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
+        #  -------------------------------------- Omni-new -------------------------------------------------
+
+        #  -------------------------------------- Omni-new -------------------------------------------------
+        # [Omni] P24: runner-local K-window decode.  When the scheduler
+        # emitted a window plan and this runner can host it, the K decode
+        # steps (forward -> make_omni_output sampling -> input feedback) run
+        # inside this single engine call; the built output is stashed for
+        # sample_tokens().  Any refusal here falls back to the normal
+        # single-step path below -- the scheduler-side reconcile in
+        # update_from_output absorbs the accounting shortfall.
+        lz_window_plan = self._lz_window_plan(scheduler_output)
+        if lz_window_plan is not None:
+            self._execute_lz_window(scheduler_output, lz_window_plan)
+            return None
         #  -------------------------------------- Omni-new -------------------------------------------------
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
@@ -902,6 +920,14 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        #  -------------------------------------- Omni-new -------------------------------------------------
+        # [Omni] P24: a K-window step already produced its full output inside
+        # execute_model(); hand it over unchanged.
+        pending_lz_output = self._lz_window_pending_output
+        if pending_lz_output is not None:
+            self._lz_window_pending_output = None
+            return pending_lz_output
+        #  -------------------------------------- Omni-new -------------------------------------------------
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
@@ -1291,6 +1317,471 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         return async_output
 
     #  -------------------------------------- Omni-new -------------------------------------------------
+    # [Omni] P24: runner-local K-window decode (MiniCPM-o Talker stage 1).
+    #
+    # The scheduler rewrites a uniform 1-token decode step into a K-token
+    # step (extra KV allocation + inflated async placeholders).  Here the
+    # runner replays the K decode steps inside one engine call: per step it
+    # advances positions/seq_lens/slot_mapping by one slot, rebuilds the
+    # decode attention metadata, runs the graph-replayed forward (whose
+    # make_omni_output samples the next codec token and mutates
+    # audio_codes.current in place), samples the binary continue/stop row,
+    # and feeds the result back as the next step's input.  Intermediate
+    # steps skip the full OmniOutput wire wrapping; the accumulated codec
+    # deltas are shipped once at window end.  The engine-side accounting
+    # closes because the step was scheduled with K tokens and K placeholders.
+    #  -------------------------------------- Omni-new -------------------------------------------------
+
+    def _lz_window_plan(self, scheduler_output: SchedulerOutput) -> dict[str, int] | None:
+        """Validate the scheduler's K-window plan against worker-local state.
+
+        Returns the plan when this runner can host the window; None means the
+        normal single-step path runs and the scheduler-side reconcile in
+        update_from_output repairs the reservation shortfall (fail-closed).
+        """
+        try:
+            plan = getattr(scheduler_output, "lz_window_steps", None)
+            if not plan:
+                return None
+            window_sizes = set(plan.values())
+            if len(window_sizes) != 1:
+                return None
+            window_k = window_sizes.pop()
+            if window_k < 2:
+                return None
+            num_scheduled = scheduler_output.num_scheduled_tokens
+            if set(num_scheduled) != set(plan) or any(n != window_k for n in num_scheduled.values()):
+                return None
+            if (
+                scheduler_output.scheduled_new_reqs
+                or scheduler_output.scheduled_spec_decode_tokens
+                or scheduler_output.scheduled_encoder_inputs
+            ):
+                return None
+            if not self.use_async_scheduling:
+                return None
+            if self.num_spec_tokens or self.speculative_config is not None:
+                return None
+            pp_group = get_pp_group()
+            if pp_group.world_size != 1 or not pp_group.is_last_rank or get_tp_group().world_size != 1:
+                return None
+            if (
+                self.vllm_config.parallel_config.data_parallel_size != 1
+                or self.pcp_size != 1
+                or self.dcp_size != 1
+                or self.use_cp
+            ):
+                return None
+            if self.lora_config is not None or self.is_pooling_model:
+                return None
+            if self.model_config.is_encoder_decoder or self.supports_mm_inputs:
+                return None
+            if self.omni_prefix_cache is not None:
+                return None
+            if getattr(self, "has_talker_mtp", False):
+                return None
+            if self._resolve_duplex_sampling_hook() is not None:
+                return None
+            if getattr(self.cache_config, "mamba_cache_mode", "off") == "align":
+                return None
+            if self.model_config.enable_return_routed_experts:
+                return None
+            if getattr(self, "calculate_kv_scales", False):
+                return None
+            if getattr(self, "dynamic_eplb", False):
+                return None
+            if self.debugger is not None:
+                return None
+            if self.ascend_config.profiling_chunk_config.enabled:
+                return None
+            if has_ec_transfer() and get_ec_transfer().is_producer:
+                return None
+            model = self.model
+            if not getattr(model, "has_preprocess", False) or not hasattr(model, "make_omni_output"):
+                return None
+            if getattr(model, "prefer_model_sampler", False):
+                return None
+            sampling_metadata = self.input_batch.sampling_metadata
+            if not sampling_metadata.no_penalties:
+                return None
+            if self.input_batch.bad_words_token_ids:
+                return None
+            if not self.input_batch.no_allowed_token_ids:
+                return None
+            if self.input_batch.logprob_token_ids:
+                return None
+            max_num_logprobs = sampling_metadata.max_num_logprobs
+            if max_num_logprobs is not None and max_num_logprobs > 0:
+                return None
+            if self.num_prompt_logprobs:
+                return None
+            num_reqs = self.input_batch.num_reqs
+            if num_reqs != len(plan) or set(self.input_batch.req_ids) != set(plan):
+                return None
+            if np.any(
+                self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                < self.input_batch.num_prompt_tokens[:num_reqs]
+            ):
+                return None
+            return plan
+        except Exception:
+            logger.exception("LZ window plan validation failed; using single-step decode")
+            return None
+
+    def _execute_lz_window(self, scheduler_output: SchedulerOutput, plan: dict[str, int]) -> None:
+        """Replay the K decode steps of the window plan inside this call.
+
+        On return the built OmniModelRunnerOutput is stashed in
+        ``_lz_window_pending_output`` for sample_tokens(), matching the
+        engine's execute_model -> sample_tokens contract.
+        """
+        window_k = next(iter(plan.values()))
+        num_reqs = self.input_batch.num_reqs
+        req_ids = list(self.input_batch.req_ids)
+        ones = np.ones(num_reqs, dtype=np.int32)
+
+        with record_function_or_nullcontext("lz_window"):
+            with self.synchronize_input_prep():
+                deferred_state_corrections_fn = self._update_states(scheduler_output)
+                if deferred_state_corrections_fn is not None:
+                    # Mamba/spec corrections are gated off for windows; apply
+                    # eagerly so per-step state starts consistent.
+                    deferred_state_corrections_fn()
+
+                # Uniform decode layout: one query token per request, frozen
+                # for the whole window.
+                self.query_start_loc.np[0] = 0
+                self.query_start_loc.np[1 : num_reqs + 1] = self.arange_np[1 : num_reqs + 1]
+                self.query_start_loc.copy_to_gpu()
+                self.query_start_loc.gpu[num_reqs + 1 :].fill_(-1)
+                self.query_pos.np[:num_reqs] = 0
+                self.query_pos.copy_to_gpu(num_reqs)
+                self.req_indices.np[:num_reqs] = self.arange_np[:num_reqs]
+                self.req_indices.copy_to_gpu(num_reqs)
+                self.num_scheduled_tokens.np[:num_reqs] = ones
+                self.num_scheduled_tokens.copy_to_gpu(num_reqs)
+                self.decode_token_per_req = 1
+                self._build_attn_state(num_reqs, ones, ones)
+                self.query_lens = torch.from_numpy(ones)
+                self.logits_indices = self.query_start_loc.gpu[1 : num_reqs + 1] - 1
+                self.with_prefill = False
+                self.num_discarded_requests = 0
+                self.discard_request_mask.np[:num_reqs] = False
+                self.discard_request_mask.copy_to_gpu(num_reqs)
+                self._omni_num_scheduled_tokens_np = ones
+
+                self.input_batch.block_table.commit_block_table(num_reqs)
+
+                (
+                    cudagraph_mode,
+                    batch_desc,
+                    _should_ubatch,
+                    _num_tokens_across_dp,
+                    cudagraph_stats,
+                ) = self._determine_batch_execution_and_padding(
+                    num_tokens=num_reqs,
+                    num_reqs=num_reqs,
+                    num_scheduled_tokens_np=ones,
+                    max_num_scheduled_tokens=1,
+                    use_cascade_attn=False,
+                    force_eager=self.model_config.enforce_eager,
+                )
+                num_tokens_padded = batch_desc.num_tokens
+
+                input_ids = self.input_ids.gpu[:num_tokens_padded]
+                inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
+                positions = self.positions[:num_tokens_padded]
+                logits_indices = self.logits_indices
+                sampling_metadata = self.input_batch.sampling_metadata
+
+                # Step 1 processes the token sampled by the previous engine
+                # step (async scheduling feedback path).
+                prev_sampled = self.input_batch.prev_sampled_token_ids
+                prev_index = self.input_batch.prev_req_id_to_index or {}
+                if prev_sampled is not None:
+                    for i, req_id in enumerate(req_ids):
+                        row = prev_index.get(req_id)
+                        if row is None:
+                            continue
+                        input_ids[i] = prev_sampled[row, 0]
+                else:
+                    self.input_ids.copy_to_gpu(num_reqs)
+
+                kv_connector_output = None
+                per_req_hidden: list[list[torch.Tensor]] = [[] for _ in range(num_reqs)]
+                per_req_deltas: list[list[torch.Tensor]] = [[] for _ in range(num_reqs)]
+                per_req_finished = [False] * num_reqs
+                sampled_steps: list[torch.Tensor] = []
+                comp_cpu = self.input_batch.num_computed_tokens_cpu
+
+                for step in range(window_k):
+                    with record_function_or_nullcontext("lz_window:step"):
+                        if step > 0:
+                            comp_cpu[:num_reqs] += 1
+                            for req_id in req_ids:
+                                req_state = self.requests.get(req_id)
+                                if req_state is not None:
+                                    req_state.num_computed_tokens += 1
+                        # Fresh CPU staging tensor per copy: the pinned batch
+                        # buffer is rewritten next step while this H2D copy
+                        # may still be in flight.
+                        self.num_computed_tokens[:num_reqs].copy_(
+                            torch.from_numpy(comp_cpu[:num_reqs].copy()), non_blocking=True
+                        )
+                        self.positions[:num_reqs] = self.num_computed_tokens[:num_reqs].to(torch.int64)
+                        self.positions[num_reqs:num_tokens_padded].zero_()
+                        self.seq_lens[:num_reqs] = (
+                            self.num_computed_tokens[:num_reqs] + self.num_scheduled_tokens.gpu[:num_reqs]
+                        )
+                        self.seq_lens[num_reqs:].fill_(0)
+                        self.optimistic_seq_lens_cpu[:num_reqs].copy_(
+                            torch.from_numpy(comp_cpu[:num_reqs] + 1)
+                        )
+                        self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
+                        self.input_batch.block_table.compute_slot_mapping(
+                            num_reqs,
+                            self.query_start_loc.gpu[: num_reqs + 1],
+                            self.positions[:num_reqs],
+                        )
+                        update_cos_sin(positions)
+
+                        (attn_metadata, _spec_common) = self._build_attention_metadata(
+                            num_tokens=num_reqs,
+                            num_reqs=num_reqs,
+                            max_query_len=1,
+                            num_tokens_padded=num_tokens_padded,
+                            num_reqs_padded=num_reqs,
+                            ubatch_slices=None,
+                            logits_indices=logits_indices,
+                            use_spec_decode=False,
+                            num_scheduled_tokens={req_id: 1 for req_id in req_ids},
+                            num_scheduled_tokens_np=ones,
+                            cascade_attn_prefix_lens=None,
+                        )
+
+                        # Per-request decode embeddings: the Talker derives the
+                        # input from the previous step's sampled codec token
+                        # (audio_codes.current in model_intermediate_buffer,
+                        # mutated in place by make_omni_output).
+                        for i, req_id in enumerate(req_ids):
+                            req_state = self.requests.get(req_id)
+                            info = self.model_intermediate_buffer.get(req_id)
+                            if info is None:
+                                info = self.model_intermediate_buffer.setdefault(req_id, {})
+                            info["request_id"] = req_id
+                            info["duplex_token_offset"] = int(comp_cpu[i])
+                            info["duplex_prompt_len"] = (
+                                len(req_state.prompt_token_ids) if req_state is not None else None
+                            )
+                            info["_omni_prompt_len"] = (
+                                len(req_state.prompt_token_ids) if req_state is not None else 0
+                            )
+                            info["_omni_num_computed_tokens"] = int(comp_cpu[i])
+                            info["_omni_is_prefill"] = False
+                            req_input_ids, req_embeds, update_dict = self.model.preprocess(
+                                input_ids=self.input_ids.gpu[i : i + 1],
+                                input_embeds=inputs_embeds[i : i + 1],
+                                **info,
+                            )
+                            seg_len = min(1, int(req_embeds.shape[0]))
+                            if seg_len:
+                                inputs_embeds[i : i + seg_len] = req_embeds[:seg_len]
+                            if isinstance(req_input_ids, torch.Tensor) and req_input_ids.numel() == 1:
+                                self.input_ids.gpu[i] = req_input_ids.reshape(-1)[0]
+                            if update_dict:
+                                self._update_intermediate_buffer(req_id, update_dict)
+
+                        with (
+                            set_ascend_forward_context(
+                                attn_metadata,
+                                self.vllm_config,
+                                num_tokens=num_tokens_padded,
+                                num_tokens_across_dp=None,
+                                aclgraph_runtime_mode=cudagraph_mode,
+                                batch_descriptor=batch_desc,
+                                num_actual_tokens=num_reqs,
+                                model_instance=self.model,
+                                max_tokens_across_pcp=0,
+                                skip_compiled=False,
+                            ),
+                            self.maybe_get_kv_connector_output(scheduler_output) as kv_output_step,
+                        ):
+                            hidden_states = self._model_forward(
+                                num_tokens_padded, input_ids, positions, None, inputs_embeds
+                            )
+                        kv_connector_output = kv_output_step
+
+                    hidden_states, mm_outputs = self.extract_multimodal_outputs(hidden_states)
+
+                    # Intermediate steps skip the full OmniOutput wire wrapping:
+                    # hidden rows and codec deltas are accumulated and shipped
+                    # once at window end.
+                    audio_deltas = None
+                    finished_flags = None
+                    if isinstance(mm_outputs, dict):
+                        codes = mm_outputs.get("codes")
+                        if isinstance(codes, dict):
+                            audio_deltas = codes.get("audio")
+                        meta = mm_outputs.get("meta")
+                        if isinstance(meta, dict):
+                            finished_flags = meta.get("finished")
+                    for i in range(num_reqs):
+                        per_req_hidden[i].append(hidden_states[i : i + 1].detach())
+                        if audio_deltas is not None and i < len(audio_deltas):
+                            delta = audio_deltas[i]
+                            if isinstance(delta, torch.Tensor) and delta.numel():
+                                per_req_deltas[i].append(delta)
+                        if finished_flags is not None and i < len(finished_flags):
+                            flag = finished_flags[i]
+                            if isinstance(flag, torch.Tensor):
+                                per_req_finished[i] = per_req_finished[i] or bool(flag.item())
+                            else:
+                                per_req_finished[i] = per_req_finished[i] or bool(flag)
+
+                    sample_hidden_states = hidden_states[logits_indices]
+                    try:
+                        logits = self.model.compute_logits(
+                            sample_hidden_states, sampling_metadata=sampling_metadata
+                        )
+                    except TypeError:
+                        logits = self.model.compute_logits(sample_hidden_states)
+                    if step == 0:
+                        # Fill the previous engine step's pending placeholder
+                        # exactly like the normal _sample path would.
+                        self.input_batch.update_async_output_token_ids()
+                    sampler_output = self.sampler(logits=logits, sampling_metadata=sampling_metadata)
+                    sampled_steps.append(sampler_output.sampled_token_ids)
+
+                    # Mirror _bookkeeping_sync's async bookkeeping: one -1
+                    # placeholder per request per step.  Values are filled at
+                    # window end; only length-based processors (min_tokens)
+                    # read them inside the window (penalties are gated off).
+                    for i in range(num_reqs):
+                        pos = self.input_batch.num_tokens_no_spec[i]
+                        self.input_batch.token_ids_cpu[i, pos : pos + 1] = -1
+                        self.input_batch.is_token_ids[i, pos : pos + 1] = True
+                        self.input_batch.num_tokens_no_spec[i] = pos + 1
+                        req_state = self.requests.get(req_ids[i])
+                        if req_state is not None:
+                            req_state.output_token_ids.append(-1)
+
+                # ---- window end: materialize results ----
+                sampled_all = torch.stack(sampled_steps, dim=0).reshape(window_k, num_reqs)
+                sampled_lists = sampled_all.cpu().tolist()
+
+                for i, req_id in enumerate(req_ids):
+                    req_state = self.requests.get(req_id)
+                    if req_state is None:
+                        continue
+                    out_ids = req_state.output_token_ids
+                    for s in range(window_k):
+                        idx = len(out_ids) - window_k + s
+                        if 0 <= idx < len(out_ids) and out_ids[idx] == -1:
+                            out_ids[idx] = int(sampled_lists[s][i])
+
+                # Async feedback for the next engine step: the last window
+                # step's sampled token becomes the next input token.
+                self.input_batch.prev_sampled_token_ids = sampled_steps[-1]
+                self.input_batch.prev_req_id_to_index = {req_id: i for i, req_id in enumerate(req_ids)}
+                copy_stream = getattr(self, "async_output_copy_stream", None)
+                if copy_stream is not None:
+                    with torch.npu.stream(copy_stream):
+                        copy_stream.wait_stream(torch.npu.current_stream())
+                        last_sampled_cpu = sampled_steps[-1].to("cpu", non_blocking=True)
+                    ready_event = torch.npu.Event(blocking=True)
+                    ready_event.record(copy_stream)
+                else:
+                    last_sampled_cpu = sampled_steps[-1].cpu()
+                    ready_event = None
+                self.input_batch.set_async_sampled_token_ids(last_sampled_cpu, ready_event)
+                self.kv_connector_output = None
+
+                self._lz_window_pending_output = self._build_lz_window_output(
+                    req_ids,
+                    sampled_lists,
+                    per_req_hidden,
+                    per_req_deltas,
+                    per_req_finished,
+                    kv_connector_output,
+                    cudagraph_stats,
+                )
+
+    def _build_lz_window_output(
+        self,
+        req_ids: list[str],
+        sampled_per_step: list[list[int]],
+        per_req_hidden: list[list[torch.Tensor]],
+        per_req_deltas: list[list[torch.Tensor]],
+        per_req_finished: list[bool],
+        kv_connector_output: Any,
+        cudagraph_stats: CUDAGraphStat | None,
+    ) -> OmniModelRunnerOutput:
+        """Assemble the OmniModelRunnerOutput for a completed window.
+
+        ``sampled_per_step`` is [K][req_index]; the engine's reconciliation
+        consumes K sampled tokens per request, matching the K tokens the
+        scheduler reserved for the window step.
+        """
+        num_reqs = len(req_ids)
+        window_k = len(sampled_per_step)
+        sampled_token_ids = [
+            [int(sampled_per_step[s][i]) for s in range(window_k)] for i in range(num_reqs)
+        ]
+
+        _engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(list(req_ids))
+        downstream_req_id_set = set(downstream_req_ids)
+        pooler_output: list[dict[str, object]] = []
+        for i, req_id in enumerate(req_ids):
+            if req_id not in downstream_req_id_set:
+                pooler_output.append({})
+                continue
+            payload: dict[str, object] = {}
+            # Hidden rows of the K window steps (tail-aligned per request);
+            # the talker batch is not the sparse-audio path (gated upstream).
+            if per_req_hidden[i]:
+                payload["hidden"] = torch.cat(per_req_hidden[i], dim=0).to("cpu").contiguous()
+            if per_req_deltas[i]:
+                payload["codes.audio"] = torch.cat(per_req_deltas[i], dim=0).to("cpu")
+            payload["meta.finished"] = torch.tensor(bool(per_req_finished[i]), dtype=torch.bool)
+            pooler_output.append(flatten_payload(payload))
+
+        pooler_output = pooler_output or []
+        if self._async_chunk and stage_sends_async_output(self.model_config):
+            pooler_inter, pooler_client = partition_payload_list(pooler_output)
+        else:
+            pooler_inter, pooler_client = pooler_output, pooler_output
+
+        if pooler_inter and self._should_accumulate_full_payload_output():
+            for i, req_id in enumerate(req_ids):
+                req_state = self.requests.get(req_id)
+                if req_state is not None and pooler_inter[i]:
+                    self.accumulate_full_payload_output(req_id, pooler_inter[i], req_state)
+
+        inter_stage_outputs = self._build_multimodal_outputs(pooler_inter)
+        multimodal_outputs = (
+            inter_stage_outputs
+            if pooler_client is pooler_inter
+            else self._build_multimodal_outputs(pooler_client)
+        )
+        model_runner_output = OmniModelRunnerOutput(
+            req_ids=list(req_ids),
+            req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
+            sampled_token_ids=sampled_token_ids,
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=None,
+            multimodal_outputs=multimodal_outputs,
+            inter_stage_outputs=inter_stage_outputs,
+            kv_connector_output=kv_connector_output,
+            ec_connector_output=None,
+            cudagraph_stats=cudagraph_stats,
+        )
+        model_runner_output.kv_extracted_req_ids = getattr(self, "kv_extracted_req_ids", None)
+        self.kv_extracted_req_ids = None
+        model_runner_output.omni_connector_output = self.get_omni_connector_output()
+        return model_runner_output
+    #  -------------------------------------- Omni-new -------------------------------------------------
+
     def _resolve_global_request_id(self, req_id: str) -> str:
         """Resolve global request ID from request state."""
         req_state = self.requests.get(req_id)

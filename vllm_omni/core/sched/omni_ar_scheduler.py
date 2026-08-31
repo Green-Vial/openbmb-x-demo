@@ -19,6 +19,12 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
+from vllm_omni.core.sched.minicpmo_lz_window import (
+    plan_lz_window,
+    reconcile_window_shortfall,
+    resolve_local_k,
+    scheduler_allows_window,
+)
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
@@ -276,10 +282,23 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             finished_reqs = {}
 
         # Wrap in omni scheduler output to carry transfer metadata.
-        return self._wrap_omni_scheduler_output(
+        scheduler_output = self._wrap_omni_scheduler_output(
             scheduler_output,
             finished_requests_needing_kv_transfer=finished_reqs,
         )
+
+        # [Omni] P24: runner-local K-window decode.  Rewrites the just-built
+        # single-token decode step into a K-token step (extra KV allocation +
+        # placeholder inflation) when the whole batch is eligible; any refusal
+        # leaves the output untouched and the normal single-step path runs.
+        try:
+            local_k = resolve_local_k()
+            if local_k > 0 and scheduler_allows_window(self):
+                plan_lz_window(self, scheduler_output, local_k)
+        except Exception:
+            logger.exception("LZ window planning failed; falling back to single step")
+
+        return scheduler_output
 
     def update_from_output(
         self,
@@ -290,6 +309,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        # [Omni] P24: K-window plan for this step (empty when not windowed).
+        window_steps = getattr(scheduler_output, "lz_window_steps", None) or {}
         pooler_outputs = model_runner_output.pooler_output
         mm_outputs = getattr(model_runner_output, "multimodal_outputs", None)
         inter_stage_outputs = getattr(model_runner_output, "inter_stage_outputs", None)
@@ -402,6 +423,18 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
+
+            # [Omni] P24: close the K-window accounting.  The window step
+            # reserved K placeholders and K optimistic computed tokens; when
+            # the runner reported fewer tokens than planned (early stop or a
+            # single-step fallback on the worker), roll back the reservations
+            # of the steps that never ran.  The cache_blocks call inside
+            # _update_request_with_output already used the true confirmed
+            # length, so this only repairs num_computed_tokens /
+            # num_output_placeholders for subsequent schedules.
+            window_k = window_steps.get(req_id)
+            if window_k is not None:
+                reconcile_window_shortfall(request, window_k, len(new_token_ids))
 
             # If criteria returns True, it means we must STOP the request.
             # If criteria returns False, it might have triggered a background

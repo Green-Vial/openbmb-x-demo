@@ -98,3 +98,7 @@ class OmniSchedulerOutput(SchedulerOutput):
 
     finished_requests_needing_kv_transfer: dict[str, dict] = field(default_factory=dict)
     pending_input_registrations: list[OmniChunkRecvHandle] = field(default_factory=list)
+    # Runner-local K-window decode plan (P24): req_id -> K decode steps the
+    # runner replays inside this single engine step.  Empty when the step is
+    # not windowed; see vllm_omni/core/sched/minicpmo_lz_window.py.
+    lz_window_steps: dict[str, int] = field(default_factory=dict)
