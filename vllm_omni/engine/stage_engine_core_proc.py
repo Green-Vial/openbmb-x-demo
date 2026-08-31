@@ -31,6 +31,7 @@ from vllm.v1.engine.utils import (
 from vllm_omni.distributed.omni_coordinator import create_stage_coord_client
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.stage_init_utils import set_death_signal
+from vllm_omni.utils.cpu_affinity import apply_stage_cpu_affinity
 
 logger = init_logger(__name__)
 
@@ -99,6 +100,17 @@ class StageEngineCoreProc(EngineCoreProc):
                 "custom reasoning parsers (e.g. step_audio) will not be "
                 "available."
             )
+
+        # P26: pin this stage engine core to its own core group (stage_id+1;
+        # orchestrator takes group 0) before any engine initialization so the
+        # hot loops stop contending for cores on a shared host. Fully
+        # defensive: failures must never block startup. The call itself is
+        # no-op when OMNI_LZ_CPU_AFFINITY=0.
+        try:
+            if omni_stage_id is not None:
+                apply_stage_cpu_affinity(int(omni_stage_id) + 1)
+        except Exception:
+            logger.debug("Stage CPU affinity skipped", exc_info=True)
 
         engine_core: StageEngineCoreProc | None = None
         coord_client = None

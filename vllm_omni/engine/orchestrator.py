@@ -54,6 +54,7 @@ from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.utils.cpu_affinity import apply_stage_cpu_affinity
 
 logger = init_logger(__name__)
 
@@ -501,6 +502,17 @@ class Orchestrator:
     async def run(self) -> None:
         """Main entry point for the Orchestrator event loop."""
         logger.info("[Orchestrator] Starting event loop")
+
+        # P26: pin the orchestrator hot loop to core group 0 (stage engine
+        # cores take groups 1/2/3 via run_stage_core) so the four busy loops
+        # stop contending for the same cores. Defensive: this event loop must
+        # never fail over an affinity syscall. No-op when
+        # OMNI_LZ_CPU_AFFINITY=0. Stage subprocesses were spawned before this
+        # point and re-bind themselves, so their masks are unaffected.
+        try:
+            apply_stage_cpu_affinity(0)
+        except Exception:
+            logger.debug("[Orchestrator] CPU affinity skipped", exc_info=True)
 
         request_task = asyncio.create_task(self._request_handler(), name="orchestrator-request-handler")
         output_task = asyncio.create_task(
