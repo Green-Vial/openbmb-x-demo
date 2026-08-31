@@ -240,7 +240,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # P27: NPUGraph replay of the deterministic sampler chain (head linear
         # + Gumbel tail). Rollback: OMNI_LZ_SAMPLER=0 — or any capture
         # failure — keeps the eager path, permanently and silently.
-        self._lz_sampler_graph_dead = os.environ.get("OMNI_LZ_SAMPLER", "1") in {"0", "false", "no", "off"}
+        # DEFAULT OFF (bench-verified): the per-replay fixed cost of two tiny
+        # graphs exceeds the saved kernel launches on this chain (RTF
+        # 0.31 -> 0.72 when on). Kept as an opt-in experiment behind
+        # OMNI_LZ_SAMPLER=1.
+        self._lz_sampler_graph_dead = os.environ.get("OMNI_LZ_SAMPLER", "0") not in {"1", "true", "yes", "on"}
         self._lz_sampler_head_graphs: dict[tuple[int, int, str], Any] = {}
         self._lz_sampler_tail_graphs: dict[tuple[int, str, bool], Any] = {}
 
