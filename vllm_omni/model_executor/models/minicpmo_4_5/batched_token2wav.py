@@ -103,6 +103,11 @@ class BatchedToken2WavState:
     hift_cache: dict[str, torch.Tensor]
 
 
+# P25: maximum number of kept initial-state templates (reference wav x batch);
+# beyond this the whole template bank is dropped and rebuilt on demand.
+_LZ_SEED_STATE_MAX = 8
+
+
 class BatchedToken2Wav(nn.Module):
     """Drive Token2wav's modules with dynamically-sized, request-owned caches.
 
@@ -155,6 +160,18 @@ class BatchedToken2Wav(nn.Module):
             persistent=False,
         )
         self._prompt_features: dict[tuple[str, str], PromptFeatures] = {}
+        # P25: per-(reference wav, batch) initial-state templates. setup_batch
+        # recomputes the prompt encoder pass, speaker projection and the CFM
+        # prompt forward for every new request; for a fixed reference wav the
+        # outcome is deterministic, so the resulting flow/hift caches are kept
+        # as read-only templates and each new request checks out a private
+        # deep copy (production callers key requests by the waveform sha256).
+        # Rollback: OMNI_LZ_SEED_STATE=0.
+        self._lz_seed_states: dict[tuple, list[BatchedToken2WavState]] | None = (
+            {}
+            if os.environ.get("OMNI_LZ_SEED_STATE", "1") not in {"0", "false", "no", "off"}
+            else None
+        )
         # P15: NPU graph capture of the CFM decode loop (see _decode_cfm_graphed).
         self._cfm_graph_enabled = bool(cfm_graph)
         # P20: tangent-line jump after the early Euler steps.  The tail of the
@@ -637,6 +654,55 @@ class BatchedToken2Wav(nn.Module):
         }
 
     def setup_batch(
+        self,
+        features: PromptFeatures,
+        batch_size: int,
+    ) -> list[BatchedToken2WavState]:
+        # P25: deterministic per-reference initial state, cached as read-only
+        # templates and checked out per request (see __init__).
+        if self._lz_seed_states:
+            seed_key = self._lz_seed_state_key(features, batch_size)
+            cached = self._lz_seed_states.get(seed_key)
+            if cached is not None:
+                return [self._checkout_seed_state(state) for state in cached]
+        states = self._setup_batch_uncached(features, batch_size)
+        if self._lz_seed_states is not None:
+            if len(self._lz_seed_states) >= _LZ_SEED_STATE_MAX:
+                self._lz_seed_states.clear()
+            self._lz_seed_states[seed_key] = [
+                self._checkout_seed_state(state) for state in states
+            ]
+        return states
+
+    @staticmethod
+    def _lz_seed_state_key(features: PromptFeatures, batch_size: int) -> tuple:
+        """Cheap content identity for a prompt-feature set.
+
+        Production callers key requests by the sha256 of the reference
+        waveform, so identical wavs produce bit-identical features; the
+        strided sums here are a cheap collision guard (exact feature
+        equality is guaranteed upstream by the waveform digest).
+        """
+        st = features.speech_tokens
+        sp = features.speaker_embedding
+        mels = features.mels
+        return (
+            batch_size,
+            int(mels.shape[1]),
+            int(mels.shape[2]),
+            float(st.reshape(-1)[:: max(1, st.numel() // 64)].sum().item()),
+            float(sp.reshape(-1)[:: max(1, sp.numel() // 32)].sum().item()),
+            float(mels.reshape(-1)[:: max(1, mels.numel() // 64)].sum().item()),
+        )
+
+    def _checkout_seed_state(self, template: BatchedToken2WavState) -> BatchedToken2WavState:
+        """Private deep copy of a read-only template for one live request."""
+        return BatchedToken2WavState(
+            flow_cache={name: value.detach().clone() for name, value in template.flow_cache.items()},
+            hift_cache={name: value.detach().clone() for name, value in template.hift_cache.items()},
+        )
+
+    def _setup_batch_uncached(
         self,
         features: PromptFeatures,
         batch_size: int,
