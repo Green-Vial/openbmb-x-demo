@@ -32,9 +32,13 @@ from vllm_omni.platforms import current_omni_platform
 logger = init_logger(__name__)
 
 _REPETITION_WINDOW = 16
-_MIN_AUDIO_TOKENS = 64
+_MIN_AUDIO_TOKENS = 128
 _MAX_AUDIO_TOKENS = 2048
 _AUDIO_TOKENS_PER_TEXT_TOKEN = 10
+# Flat margin added on top of the length estimate: prosody, leading silence
+# and the unvoiced tail are not proportional to text length, so the pure
+# ratio underestimates them for short prompts.
+_AUDIO_TOKENS_TEXT_OVERHEAD = 48
 # Codec-token sampling happens inside the model; vLLM sampling parameters
 # only choose the Talker's binary continue/stop row.
 _CODEC_SEED = 42
@@ -47,16 +51,21 @@ _DUPLEX_CODEC_TOKENS_PER_CHUNK = 26
 
 
 def _max_audio_tokens(condition_tokens: int) -> int:
-    """Bound codec generation with a conservative text-length estimate.
+    """Bound codec generation with the checkpoint's native length heuristic.
 
-    EOS is masked for the first 50 steps, so a direct ``text_tokens * 10``
-    limit can terminate short responses before EOS is eligible. The 2048
-    ceiling matches the checkpoint's native generation default and keeps the
-    sequence within the Talker's 4096-position context.
+    ``text_tokens * 10 + 48`` mirrors the native generation budget: the ratio
+    covers the proportional body, the flat +48 covers prosody/silence tails.
+    The 128 floor keeps short responses running past the 50-step EOS mask
+    (below it, EOS is still ineligible when the cap hits); the 2048 ceiling
+    matches the native default and stays within the Talker's 4096-position
+    context.
     """
     return max(
         _MIN_AUDIO_TOKENS,
-        min(_MAX_AUDIO_TOKENS, condition_tokens * _AUDIO_TOKENS_PER_TEXT_TOKEN),
+        min(
+            _MAX_AUDIO_TOKENS,
+            condition_tokens * _AUDIO_TOKENS_PER_TEXT_TOKEN + _AUDIO_TOKENS_TEXT_OVERHEAD,
+        ),
     )
 
 

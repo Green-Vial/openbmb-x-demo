@@ -2627,6 +2627,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # when the pipeline produced no audio for this request.
         mm_output = getattr(final_res.outputs[0], "multimodal_output", None) or {}
         audio_data = mm_output.get("audio")
+        if audio_data is None:
+            # Stage-2 (Code2Wav) wire payloads key the generated audio as
+            # "model_outputs". The speech / audio-generate / realtime backends
+            # already fall back to that key; chat completions was the only
+            # audio backend that didn't, so it never surfaced generated audio.
+            audio_data = mm_output.get("model_outputs")
         if isinstance(audio_data, list):
             if not audio_data:
                 audio_tensor = None

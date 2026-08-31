@@ -911,7 +911,23 @@ def llm2tts(
                     special_token_ids.get("chunk_tts_eos_token_id"),
                 }
             tts_token_ids_slice = torch.tensor(full_token_ids[tts_bos_idx:end_idx], dtype=torch.long)
-            tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].contiguous()  # T2: keep native dtype
+            # Vision features expand into more hidden rows than the collapsed
+            # <image>/<video> placeholder(s) in token ids (e.g. 1 image token
+            # -> N rows). All expanded rows live inside the prompt, i.e. ahead
+            # of the generated TTS span, so within the span every token index
+            # i maps to hidden row i + (hidden_rows - token_rows). Without the
+            # shift the slice reads text rows from wrong positions and
+            # image->TTS misaligns/crashes in the talker. Text-only requests
+            # have offset 0 and keep the original path unchanged.
+            _hidden_offset = thinker_hidden_states.shape[0] - len(full_token_ids)
+            if 0 < _hidden_offset < len(full_token_ids):
+                # With an explicit eos the end index is token-space and shifts
+                # too; without one end_idx is already hidden-space (the full
+                # tail of the hidden tensor), so only the start shifts.
+                _hidden_end = end_idx + _hidden_offset if tts_eos_idx is not None else end_idx
+                tts_hidden_slice = thinker_hidden_states[tts_bos_idx + _hidden_offset : _hidden_end].contiguous()
+            else:
+                tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].contiguous()  # T2: keep native dtype
         elif is_native_duplex_handoff:
             # Official MiniCPM-o duplex does not prefill an assistant
             # <|tts_bos|> boundary before generation. A segment delta can

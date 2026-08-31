@@ -75,7 +75,7 @@ def _routed(output, index: int):
 
 @pytest.mark.parametrize(
     ("condition_tokens", "expected"),
-    [(3, 64), (100, 1000), (1000, 2048)],
+    [(3, 128), (8, 128), (100, 1048), (1000, 2048)],
 )
 def test_audio_token_limit_scales_with_condition_length(
     condition_tokens: int,
