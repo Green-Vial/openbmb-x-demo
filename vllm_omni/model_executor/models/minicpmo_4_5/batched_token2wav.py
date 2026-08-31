@@ -172,6 +172,9 @@ class BatchedToken2Wav(nn.Module):
             if os.environ.get("OMNI_LZ_SEED_STATE", "1") not in {"0", "false", "no", "off"}
             else None
         )
+        # P25b: projected speaker embeddings per PromptFeatures instance x
+        # batch width (id-keyed; see _lz_projected_speakers).
+        self._lz_spk_projection: dict[int, dict[int, torch.Tensor]] = {}
         # P15: NPU graph capture of the CFM decode loop (see _decode_cfm_graphed).
         self._cfm_graph_enabled = bool(cfm_graph)
         # P20: tangent-line jump after the early Euler steps.  The tail of the
@@ -660,13 +663,14 @@ class BatchedToken2Wav(nn.Module):
     ) -> list[BatchedToken2WavState]:
         # P25: deterministic per-reference initial state, cached as read-only
         # templates and checked out per request (see __init__).
+        seed_key = None
         if self._lz_seed_states:
             seed_key = self._lz_seed_state_key(features, batch_size)
             cached = self._lz_seed_states.get(seed_key)
             if cached is not None:
                 return [self._checkout_seed_state(state) for state in cached]
         states = self._setup_batch_uncached(features, batch_size)
-        if self._lz_seed_states is not None:
+        if seed_key is not None and self._lz_seed_states is not None:
             if len(self._lz_seed_states) >= _LZ_SEED_STATE_MAX:
                 self._lz_seed_states.clear()
             self._lz_seed_states[seed_key] = [
@@ -701,6 +705,35 @@ class BatchedToken2Wav(nn.Module):
             flow_cache={name: value.detach().clone() for name, value in template.flow_cache.items()},
             hift_cache={name: value.detach().clone() for name, value in template.hift_cache.items()},
         )
+
+    def _lz_projected_speakers(
+        self,
+        features: PromptFeatures,
+        batch_size: int,
+        speakers: torch.Tensor,
+    ) -> torch.Tensor:
+        """P25b: per-prompt speaker-projection cache.
+
+        ``decode_batch`` re-runs ``affine(normalize(spk))`` on every streamed
+        chunk although the outcome depends only on the (fixed) prompt feature
+        set and the batch width. Cache keyed by the feature object identity
+        (each (cache_id, wav) pair owns one PromptFeatures instance whose
+        lifetime spans the stream); the projection result is read-only across
+        chunks. Rollback shares OMNI_LZ_SEED_STATE=0.
+        """
+        if not self._lz_seed_states:
+            return self.flow.spk_embed_affine_layer(F.normalize(speakers, dim=1))
+        by_batch = self._lz_spk_projection.get(id(features))
+        if by_batch is None:
+            by_batch = {}
+            if len(self._lz_spk_projection) >= _LZ_SEED_STATE_MAX:
+                self._lz_spk_projection.clear()
+            self._lz_spk_projection[id(features)] = by_batch
+        projected = by_batch.get(batch_size)
+        if projected is None:
+            projected = self.flow.spk_embed_affine_layer(F.normalize(speakers, dim=1))
+            by_batch[batch_size] = projected
+        return projected
 
     def _setup_batch_uncached(
         self,
@@ -932,6 +965,7 @@ class BatchedToken2Wav(nn.Module):
                 )
         flow_cache = self._stack_flow_cache(states)
         speakers = features.speaker_embedding.expand(batch_size, -1)
+        projected_speakers = self._lz_projected_speakers(features, batch_size, speakers)
         with self._autocast(tokens.device):
             hidden, conformer_cnn, conformer_att = self._encode_chunk(
                 tokens,
@@ -939,7 +973,6 @@ class BatchedToken2Wav(nn.Module):
                 cnn_cache=flow_cache["conformer_cnn_cache"],
                 att_cache=flow_cache["conformer_att_cache"],
             )
-            projected_speakers = self.flow.spk_embed_affine_layer(F.normalize(speakers, dim=1))
             cond = torch.zeros_like(hidden).transpose(1, 2).contiguous()
             chunk_mel, estimator_cnn, estimator_att = self._decode_cfm(
                 hidden.transpose(1, 2).contiguous(),
