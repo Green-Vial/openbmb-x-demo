@@ -35,6 +35,11 @@ logger = init_logger(__name__)
 _REPETITION_WINDOW = 16
 # P23: rows of pre-drawn Exp(1) noise per request block (see _sample_audio_code).
 _LZ_GUMBEL_BLOCK = 64
+# P27: budget for captured sampler graphs (head + tail buckets summed over
+# all signatures); a new signature past the budget permanently reverts the
+# sampler to eager (see _lz_sampler_head_graph / _lz_sampler_tail_graph).
+_LZ_SAMPLER_MAX_GRAPHS = 4
+_LZ_SAMPLER_MISSING = object()
 _MIN_AUDIO_TOKENS = 128
 _MAX_AUDIO_TOKENS = 2048
 _AUDIO_TOKENS_PER_TEXT_TOKEN = 10
@@ -142,6 +147,65 @@ def _apply_top_k_top_p(
     return filtered
 
 
+class _LZSamplerHeadBucket:
+    """P27: static buffers + captured NPUGraph for the head-code linear.
+
+    Graph body: ``head_code[0](h).float() / temperature`` — the deterministic
+    ops between the talker hidden state and the raw codec logits. The linear
+    weight is referenced by address and owned by the model, so it stays alive
+    for the graph's lifetime; the bucket owns the static input/output
+    buffers that ``copy_``/replay traffic flows through.
+    """
+
+    def __init__(self) -> None:
+        self.graph: Any = None
+        self.h_in: torch.Tensor | None = None
+        self.logits_out: torch.Tensor | None = None
+
+
+class _LZSamplerTailBucket:
+    """P27: static buffers + captured NPUGraph for the Gumbel tail.
+
+    Graph body: optional EOS mask (min_tokens state) → ``logits - log(q)`` →
+    ``argmax``. Both inputs (warped logits, Exp(1) noise row) are pure data,
+    copied into the static buffers before every replay; the codec id is read
+    from the fixed output buffer and cloned by the caller before it can
+    outlive the next replay.
+    """
+
+    def __init__(self) -> None:
+        self.graph: Any = None
+        self.logits_in: torch.Tensor | None = None
+        self.q_in: torch.Tensor | None = None
+        self.id_out: torch.Tensor | None = None
+
+
+def _lz_head_code_logits(head: nn.Linear, hidden: torch.Tensor, temperature: float) -> torch.Tensor:
+    """P27 head-graph body: codec logits from a [1, hidden] talker row.
+
+    Shared by the capture path and the eager path so both issue the identical
+    op sequence (linear → float → temperature scale) — the precondition for
+    graph replay being bit-identical to eager.
+    """
+    return head(hidden).float() / temperature
+
+
+def _lz_gumbel_tail(
+    logits: torch.Tensor,
+    q: torch.Tensor,
+    eos_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """P27 tail-graph body: optional EOS mask, then ``logits - log(q)`` → argmax.
+
+    Shared by the capture path and the eager fallback so both issue the
+    identical op sequence. ``q`` is one Exp(1) noise row (P23); ``eos_mask``
+    is a static [1, vocab] bool buffer (None = min_tokens already satisfied).
+    """
+    if eos_mask is not None:
+        logits = logits.masked_fill(eos_mask, float("-inf"))
+    return (logits - torch.log(q.clamp_min(1e-9))).argmax(dim=-1)
+
+
 class _MiniCPMTTSProjector(nn.Module):
     """Checkpoint-compatible hidden-state projector used by MiniCPMTTS."""
 
@@ -173,6 +237,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._deferred_cleanup_ids: set[str] = set()
         # P12b: (device, dtype) -> (continue_row, stop_row) device templates.
         self._stop_row_templates: dict[tuple[torch.device, torch.dtype], tuple[torch.Tensor, torch.Tensor]] = {}
+        # P27: NPUGraph replay of the deterministic sampler chain (head linear
+        # + Gumbel tail). Rollback: OMNI_LZ_SAMPLER=0 — or any capture
+        # failure — keeps the eager path, permanently and silently.
+        self._lz_sampler_graph_dead = os.environ.get("OMNI_LZ_SAMPLER", "1") in {"0", "false", "no", "off"}
+        self._lz_sampler_head_graphs: dict[tuple[int, int, str], Any] = {}
+        self._lz_sampler_tail_graphs: dict[tuple[int, str, bool], Any] = {}
 
         tts_config = getattr(config, "tts_config", None)
         if tts_config is None and getattr(config, "model_type", None) == "minicpmtts":
@@ -411,6 +481,128 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._request_generators[request_id] = generator
         return generator
 
+    def _lz_sampler_head_graph(self, hidden_state: torch.Tensor) -> _LZSamplerHeadBucket | None:
+        """P27: head-linear bucket for this signature, capturing lazily.
+
+        Signature (hidden_size, vocab, dtype) — the talker samples one row per
+        request, so a deployment holds a single entry. Returns None (eager)
+        when disabled/dead or when the graph budget is exhausted.
+        """
+        if self._lz_sampler_graph_dead or not self._lz_gumbel_sampling:
+            return None
+        key = (int(hidden_state.shape[-1]), int(self._num_audio_tokens), str(hidden_state.dtype))
+        bucket = self._lz_sampler_head_graphs.get(key, _LZ_SAMPLER_MISSING)
+        if bucket is _LZ_SAMPLER_MISSING:
+            if len(self._lz_sampler_head_graphs) + len(self._lz_sampler_tail_graphs) >= _LZ_SAMPLER_MAX_GRAPHS:
+                self._lz_sampler_graph_dead = True
+                logger.info("P27 sampler graph budget exhausted; sampler stays eager")
+                return None
+            bucket = self._lz_capture_head_graph(hidden_state)
+            self._lz_sampler_head_graphs[key] = bucket
+        return bucket
+
+    def _lz_capture_head_graph(self, hidden_state: torch.Tensor) -> _LZSamplerHeadBucket | None:
+        """Capture ``head_code linear + temperature``; eager forever on failure."""
+        try:
+            if not (hasattr(torch, "npu") and hasattr(torch.npu, "NPUGraph")):
+                raise RuntimeError("torch.npu.NPUGraph is unavailable on this platform")
+            device = hidden_state.device
+            b = _LZSamplerHeadBucket()
+            b.h_in = torch.zeros((1, int(hidden_state.shape[-1])), dtype=hidden_state.dtype, device=device)
+
+            def _body(h: torch.Tensor) -> torch.Tensor:
+                return _lz_head_code_logits(self.head_code[0], h, self._codec_temperature)
+
+            with torch.no_grad():
+                _body(b.h_in)  # allocator/kernel warmup on the static buffers
+            torch.npu.synchronize()
+            graph = torch.npu.NPUGraph()
+            with torch.no_grad(), torch.npu.graph(graph):
+                # Tensors allocated during capture live in the graph's private
+                # pool and keep a stable address across replays (same pattern
+                # as the CFM/HiFT buckets in batched_token2wav.py).
+                b.logits_out = _body(b.h_in)
+            b.graph = graph
+            torch.npu.synchronize()
+            logger.info("P27 sampler head graph captured: hidden=%d", b.h_in.shape[-1])
+            return b
+        except Exception:
+            logger.exception("P27 sampler head graph capture failed; sampler stays eager")
+            self._lz_sampler_graph_dead = True
+            return None
+
+    def _lz_sampler_tail_graph(self, logits: torch.Tensor, mask_eos: bool) -> _LZSamplerTailBucket | None:
+        """P27: Gumbel-tail bucket for (vocab, dtype, min_tokens state)."""
+        if self._lz_sampler_graph_dead:
+            return None
+        key = (int(logits.shape[-1]), str(logits.dtype), bool(mask_eos))
+        bucket = self._lz_sampler_tail_graphs.get(key, _LZ_SAMPLER_MISSING)
+        if bucket is _LZ_SAMPLER_MISSING:
+            if len(self._lz_sampler_head_graphs) + len(self._lz_sampler_tail_graphs) >= _LZ_SAMPLER_MAX_GRAPHS:
+                self._lz_sampler_graph_dead = True
+                logger.info("P27 sampler graph budget exhausted; sampler stays eager")
+                return None
+            bucket = self._lz_capture_tail_graph(logits, bool(mask_eos))
+            self._lz_sampler_tail_graphs[key] = bucket
+        return bucket
+
+    def _lz_capture_tail_graph(self, logits: torch.Tensor, mask_eos: bool) -> _LZSamplerTailBucket | None:
+        """Capture ``eos mask + log(q) + sub + argmax`` for one min_tokens state."""
+        try:
+            if not (hasattr(torch, "npu") and hasattr(torch.npu, "NPUGraph")):
+                raise RuntimeError("torch.npu.NPUGraph is unavailable on this platform")
+            device = logits.device
+            vocab = int(logits.shape[-1])
+            b = _LZSamplerTailBucket()
+            b.logits_in = torch.zeros((1, vocab), dtype=logits.dtype, device=device)
+            b.q_in = torch.zeros((1, vocab), dtype=logits.dtype, device=device)
+            # min_tokens EOS mask as a static input: the False variant is an
+            # all-False no-op, the True variant pins -inf at the EOS column —
+            # both bit-identical to the eager scalar assign.
+            eos_mask = torch.zeros((1, vocab), dtype=torch.bool, device=device)
+            if mask_eos:
+                eos_mask[..., self._num_audio_tokens - 1] = True
+
+            def _body() -> torch.Tensor:
+                return _lz_gumbel_tail(b.logits_in, b.q_in, eos_mask if mask_eos else None)
+
+            with torch.no_grad():
+                _body()
+            torch.npu.synchronize()
+            graph = torch.npu.NPUGraph()
+            with torch.no_grad(), torch.npu.graph(graph):
+                b.id_out = _body()
+            b.graph = graph
+            torch.npu.synchronize()
+            logger.info("P27 sampler tail graph captured: vocab=%d mask_eos=%s", vocab, mask_eos)
+            return b
+        except Exception:
+            logger.exception("P27 sampler tail graph capture failed; sampler stays eager")
+            self._lz_sampler_graph_dead = True
+            return None
+
+    def _lz_gumbel_row(self, request_id: str, logits: torch.Tensor, step: int) -> torch.Tensor | None:
+        """This step's Exp(1) noise row (P23), or None without request state.
+
+        Extracted verbatim from the original inline block so the generator's
+        consumption order stays exactly the same (same block size, same redraw
+        points); the caller falls back to ``multinomial`` on None.
+        """
+        request_states = getattr(self, "_request_audio_states", {})
+        state = request_states.get(request_id) if isinstance(request_states, dict) else None
+        if not isinstance(state, dict):
+            return None
+        device = logits.device
+        vocab = logits.shape[-1]
+        noise = state.get("lz_gumbel")
+        if not isinstance(noise, torch.Tensor) or noise.device != device or noise.shape[-1] != vocab:
+            noise = torch.empty((_LZ_GUMBEL_BLOCK, vocab), device=device)
+        row = step % _LZ_GUMBEL_BLOCK
+        if step == 0 or row == 0 or not isinstance(noise, torch.Tensor) or noise.shape[-1] != vocab:
+            noise.exponential_(generator=self._request_generator(request_id, device))
+            state["lz_gumbel"] = noise
+        return noise[row : row + 1]
+
     def _sample_audio_code(
         self,
         hidden_state: torch.Tensor,
@@ -418,7 +610,16 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         request_id: str,
         step: int,
     ) -> torch.Tensor:
-        logits = self.head_code[0](hidden_state).float() / self._codec_temperature
+        # P27: replay the head linear + temperature scale from a graph when
+        # available. The replay output is a fixed buffer holding the raw
+        # (pre-warp) logits; the eager warps below only read it.
+        head_bucket = self._lz_sampler_head_graph(hidden_state)
+        if head_bucket is not None:
+            head_bucket.h_in.copy_(hidden_state)
+            head_bucket.graph.replay()
+            logits = head_bucket.logits_out
+        else:
+            logits = self.head_code[0](hidden_state).float() / self._codec_temperature
         eos_id = self._num_audio_tokens - 1
         logits = _apply_repetition_penalty(
             logits,
@@ -431,6 +632,32 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         min_tokens = (
             int(state.get("min_tokens", self._codec_min_tokens)) if isinstance(state, dict) else self._codec_min_tokens
         )
+        if self._lz_gumbel_sampling:
+            q = self._lz_gumbel_row(request_id, logits, step)
+            if q is not None:
+                mask_eos = step < min_tokens
+                # P27: replay the deterministic tail (eos mask + log q + sub +
+                # argmax). The min_tokens EOS mask rides inside the tail graph
+                # (hence the mask_eos signature key); masking after the warp is
+                # equivalent to the eager mask-before-warp order because -inf
+                # carries zero softmax mass and never survives top-k/top-p.
+                tail_bucket = self._lz_sampler_tail_graph(logits, mask_eos)
+                if tail_bucket is not None:
+                    tail_bucket.logits_in.copy_(logits)
+                    tail_bucket.q_in.copy_(q)
+                    tail_bucket.graph.replay()
+                    # The fixed output buffer is reused by every replay:
+                    # clone before the id reaches longer-lived consumers.
+                    return tail_bucket.id_out.clone().reshape(())
+                if mask_eos:
+                    logits[..., eos_id] = float("-inf")
+                logits = _apply_top_k_top_p(
+                    logits,
+                    top_k=self._codec_top_k,
+                    top_p=self._codec_top_p,
+                    min_tokens_to_keep=3,
+                )
+                return (logits - torch.log(q.clamp_min(1e-9))).argmax(dim=-1).reshape(())
         if step < min_tokens:
             logits[..., eos_id] = float("-inf")
         logits = _apply_top_k_top_p(
@@ -450,20 +677,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # order per step), leaving only ``add`` + ``argmax`` kernels on the
         # sampling path.  The drawn values are distribution-equal but not
         # bit-identical to ``multinomial`` (documented, WER/SIM gated).
-        if self._lz_gumbel_sampling:
-            device = logits.device
-            state = request_states.get(request_id) if isinstance(request_states, dict) else None
-            if isinstance(state, dict):
-                noise = state.get("lz_gumbel")
-                vocab = logits.shape[-1]
-                if not isinstance(noise, torch.Tensor) or noise.device != device or noise.shape[-1] != vocab:
-                    noise = torch.empty((_LZ_GUMBEL_BLOCK, vocab), device=device)
-                row = step % _LZ_GUMBEL_BLOCK
-                if step == 0 or row == 0 or not isinstance(noise, torch.Tensor) or noise.shape[-1] != vocab:
-                    noise.exponential_(generator=self._request_generator(request_id, device))
-                    state["lz_gumbel"] = noise
-                q = noise[row : row + 1]
-                return (logits - torch.log(q.clamp_min(1e-9))).argmax(dim=-1).reshape(())
+        # The Gumbel branch (with the P27 graph replay of its deterministic
+        # tail) is handled above; this remainder is the multinomial fallback
+        # for OMNI_LZ_GUMBEL=0 or a missing request state.
         probabilities = torch.softmax(logits, dim=-1)
         return torch.multinomial(
             probabilities,
