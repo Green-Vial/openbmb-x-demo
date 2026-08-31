@@ -42,7 +42,7 @@ logger = init_logger(__name__)
 # Environment switch: "0" disables the window, positive values select K
 # (clamped to MAX_LOCAL_K).  Unset falls back to DEFAULT_LOCAL_K.
 ENV_LOCAL_K = "OMNI_LZ_LOCAL_K"
-DEFAULT_LOCAL_K = 8
+DEFAULT_LOCAL_K = 10
 MAX_LOCAL_K = 16
 
 # Stage-1 Talker architectures whose model-side sampling advances per-request
