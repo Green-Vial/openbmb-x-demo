@@ -857,6 +857,69 @@ def _build_engine_args(
     return engine_args
 
 
+# ---------------------------------------------------------------------------
+# Submission defaults for LLM_AR stages (thinker + talker).
+#
+# The official evaluation harness boots stages from the *official baseline*
+# deploy config, which pins PIECEWISE cudagraphs and omits speculative
+# decoding entirely. Anything we only set in our own yaml therefore never
+# engages at evaluation time. The defaults below are applied from code so
+# they hold under whichever deploy config is passed on the command line;
+# an explicit value in the incoming engine_args still wins except where a
+# force-overwrite is called out. Set OMNI_CODEGEN_STAGE_DEFAULTS=0 to roll
+# the whole block back.
+# ---------------------------------------------------------------------------
+
+# MiniCPM-o 4.5 stream-termination ids: <|tts_eos|> and <|im_end|>. Once the
+# thinker emits either one the TTS handoff slice (tts_bos..tts_eos) is closed
+# and any further tokens have no downstream consumer.
+_THINKER_STOP_TOKEN_IDS = (151704, 151645)
+
+
+def _apply_llm_ar_submission_defaults(ps, engine_args: dict[str, Any]) -> None:
+    import os as _os
+
+    if _os.environ.get("OMNI_CODEGEN_STAGE_DEFAULTS", "1") == "0":
+        return
+
+    # (1) Decode-path cudagraphs. PIECEWISE (the baseline default) pays a
+    # host gap at every layer boundary during decode; FULL_AND_PIECEWISE
+    # runs uniform decode as one whole graph while keeping PIECEWISE for
+    # prefill/mixed shapes (verified on 910B3, P5). Force-overwrite: the
+    # baseline config's own PIECEWISE would otherwise always win the merge.
+    cc = engine_args.get("compilation_config")
+    if not isinstance(cc, dict):
+        cc = {}
+        engine_args["compilation_config"] = cc
+    cc["cudagraph_mode"] = "FULL_AND_PIECEWISE"
+    # Thinker runs ngram speculative decode (below); its verify forward
+    # carries 1 + num_spec tokens per request, so the capture buckets must
+    # reach past that. Talker is 1 token/step and stays on small buckets.
+    cc.setdefault(
+        "cudagraph_capture_sizes",
+        [8, 16, 32, 64] if ps.stage_id == 0 else [1, 2, 4, 8],
+    )
+    # Ascend compiler: pre-compiled static-shape kernels for captured shapes.
+    additional = engine_args.setdefault("additional_config", {})
+    additional.setdefault("ascend_compilation_config", {}).setdefault(
+        "enable_static_kernel", True
+    )
+
+    # (2) ngram speculative decoding on the thinker. Greedy sampling verifies
+    # draft tokens exactly, so sampled ids are unchanged; the win is fewer
+    # engine steps for the echo-heavy TTS prompt replay. Disabled entirely
+    # when the deploy config (or caller) already chose a speculative method.
+    if ps.stage_id == 0 and not engine_args.get("speculative_config"):
+        spec_k = int(_os.environ.get("OMNI_S0_SPEC_TOKENS", "12"))
+        if spec_k > 0:
+            engine_args["speculative_config"] = {
+                "method": "ngram",
+                "num_speculative_tokens": spec_k,
+                "prompt_lookup_max": max(10, spec_k),
+                "prompt_lookup_min": 1,
+            }
+
+
 def _build_extras(
     ps: StagePipelineConfig,
     ds: StageDeployConfig | None,
@@ -867,6 +930,17 @@ def _build_extras(
     if ds is not None and ds.default_sampling_params:
         sampling.update(ds.default_sampling_params)
     sampling.update(ps.sampling_constraints)
+    # (3) Thinker early termination: the TTS handoff slice ends at the first
+    # <|tts_eos|>/<|im_end|>, so tokens generated past them are dead weight
+    # (an 8B-model step each). Adding them as stop ids trims ~1-2 steps per
+    # request; the downstream slice and its audio are unchanged.
+    import os as _os
+
+    if ps.stage_id == 0 and _os.environ.get("OMNI_S0_EARLY_STOP", "1") != "0":
+        stops = sampling.setdefault("stop_token_ids", [])
+        for token_id in _THINKER_STOP_TOKEN_IDS:
+            if token_id not in stops:
+                stops.append(token_id)
     if sampling:
         extras["default_sampling_params"] = sampling
     if ds is not None and ds.output_connectors:
@@ -937,6 +1011,7 @@ def merge_pipeline_deploy(
         )
         if ps.execution_type == StageExecutionType.LLM_AR:
             engine_args["async_scheduling"] = sched_cls is OmniARAsyncScheduler
+            _apply_llm_ar_submission_defaults(ps, engine_args)
         extras = _build_extras(ps, ds)
         runtime: dict[str, Any] = {"process": True}
         if ds is not None:
