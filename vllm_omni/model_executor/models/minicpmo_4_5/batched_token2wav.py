@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -156,6 +157,19 @@ class BatchedToken2Wav(nn.Module):
         self._prompt_features: dict[tuple[str, str], PromptFeatures] = {}
         # P15: NPU graph capture of the CFM decode loop (see _decode_cfm_graphed).
         self._cfm_graph_enabled = bool(cfm_graph)
+        # P20: tangent-line jump after the early Euler steps.  The tail of the
+        # flow-matching trajectory is near-straight, so after ``stop`` steps
+        # the remaining distance is covered analytically with the last
+        # velocity (x += (1 - t) * v) instead of more DiT evaluations.
+        # ``stop=0`` disables.  The extrapolated path is numerically different
+        # from the full integration (quality gated by the WER/SIM benchmark);
+        # the skipped steps' cache stack slots are padded with the last step's
+        # caches so the downstream streaming contract stays unchanged.
+        try:
+            _tjs = int(os.environ.get("OMNI_LZ_TJS_STOP", "1"))
+        except ValueError:
+            _tjs = 0
+        self._lz_tjs_stop = _tjs if 0 < _tjs < self.n_timesteps else 0
         self._cfm_graphs: dict[tuple[int, int, int], _CFMGraphBucket | None] = {}
         self._cfm_graph_pool: Any = None
         self._cfm_graph_dead = False
@@ -369,6 +383,14 @@ class BatchedToken2Wav(nn.Module):
             x = x + dts[step] * velocity
             next_cnn.append(step_cnn)
             next_att.append(step_att)
+            # P20: analytic tail jump (see __init__); only reachable on the
+            # eager path because the graph path is gated off when enabled.
+            if self._lz_tjs_stop and step + 1 >= self._lz_tjs_stop and step + 1 < self.n_timesteps:
+                t_cur = 1.0 - torch.stack(dts[step + 1 :]).sum()
+                x = x + (1.0 - t_cur) * velocity
+                next_cnn.extend([step_cnn] * (self.n_timesteps - step - 1))
+                next_att.extend([step_att] * (self.n_timesteps - step - 1))
+                break
         return x, torch.stack(next_cnn), torch.stack(next_att)
 
     def _capture_cfm_graph(
@@ -566,6 +588,12 @@ class BatchedToken2Wav(nn.Module):
                 dt = timeline[step + 2] - time[0]
             next_cnn.append(step_cnn)
             next_att.append(step_att)
+            # P20: analytic tail jump (see __init__).
+            if self._lz_tjs_stop and step + 1 >= self._lz_tjs_stop and step + 1 < self.n_timesteps:
+                x = x + (1.0 - timeline[step + 1]) * velocity
+                next_cnn.extend([step_cnn] * (self.n_timesteps - step - 1))
+                next_att.extend([step_att] * (self.n_timesteps - step - 1))
+                break
         return x, torch.stack(next_cnn), torch.stack(next_att)
 
     @staticmethod
@@ -906,7 +934,7 @@ class BatchedToken2Wav(nn.Module):
         return audios, next_states
 
     @torch.inference_mode()
-    def warmup(self, prompt_wav: str, batch_sizes=(1,), chunk_frames: int = 28) -> None:
+    def warmup(self, prompt_wav: str, batch_sizes=(1,), chunk_frames: int | tuple[int, ...] = 28) -> None:
         """Exercise the full prepare->setup->decode path before the first live request.
 
         The bench client's ``--num-warmups`` only warms the *client* side; the
@@ -927,21 +955,26 @@ class BatchedToken2Wav(nn.Module):
         Args:
             prompt_wav: reference audio to drive the warmup.
             batch_sizes: batch dimensions to exercise (match max_num_seqs).
-            chunk_frames: codec frames per streamed chunk (25 data + 3 left
-                context = 28 by default).
+            chunk_frames: codec frame widths to exercise. A single int or a
+                tuple; the live stream hits at least two widths (initial
+                chunk + steady chunk with 3 left-context frames), and each
+                width owns its own graph bucket / autotuned kernels, so all
+                of them must be paid here instead of on request #1.
         """
         device = self.speech_window.device
         cache_id = "__warmup__"
-        logger.info("Code2Wav warmup: start (batch_sizes=%s, chunk_frames=%d)", list(batch_sizes), chunk_frames)
+        widths = (chunk_frames,) if isinstance(chunk_frames, int) else tuple(dict.fromkeys(int(c) for c in chunk_frames))
+        logger.info("Code2Wav warmup: start (batch_sizes=%s, chunk_frames=%s)", list(batch_sizes), list(widths))
         try:
             features = self.prepare_prompt(cache_id, prompt_wav)
             for batch_size in batch_sizes:
                 states = self.setup_batch(features, batch_size)
-                tokens = torch.zeros((batch_size, chunk_frames), dtype=torch.long, device=device)
-                # One mid-stream chunk and one final chunk cover both decode
-                # branches (non-final keeps the tail cache; final emits it).
-                self.decode_batch(tokens, features, states, last_chunk=False)
-                self.decode_batch(tokens, features, states, last_chunk=True)
+                for width in widths:
+                    tokens = torch.zeros((batch_size, width), dtype=torch.long, device=device)
+                    # One mid-stream chunk and one final chunk cover both decode
+                    # branches (non-final keeps the tail cache; final emits it).
+                    self.decode_batch(tokens, features, states, last_chunk=False)
+                    self.decode_batch(tokens, features, states, last_chunk=True)
             torch.accelerator.synchronize(device)
             logger.info("Code2Wav warmup: done")
         except Exception:

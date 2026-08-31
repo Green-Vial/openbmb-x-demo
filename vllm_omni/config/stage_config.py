@@ -895,10 +895,24 @@ def _apply_llm_ar_submission_defaults(ps, engine_args: dict[str, Any]) -> None:
     # Thinker runs ngram speculative decode (below); its verify forward
     # carries 1 + num_spec tokens per request, so the capture buckets must
     # reach past that. Talker is 1 token/step and stays on small buckets.
+    # P21: size the stage-0 bucket set so the spec-decode verify width
+    # (K + 1 rows) lands on a bucket with zero padding, and keep at least one
+    # larger bucket for prefill/mixed piecewise shapes. With the default
+    # K=15 the verify batch is exactly 16 rows -> bucket 16, no dummy rows.
     cc.setdefault(
         "cudagraph_capture_sizes",
         [8, 16, 32, 64] if ps.stage_id == 0 else [1, 2, 4, 8],
     )
+    if ps.stage_id == 0:
+        spec_k_default = int(_os.environ.get("OMNI_S0_SPEC_TOKENS", "15"))
+        if spec_k_default > 0 and isinstance(cc.get("cudagraph_capture_sizes"), list):
+            _need = spec_k_default + 1
+            _buckets = sorted({int(s) for s in cc["cudagraph_capture_sizes"]})
+            if not any(b >= _need for b in _buckets):
+                import math as _math
+
+                _buckets.append(1 << max(3, _math.ceil(_math.log2(_need))))
+                cc["cudagraph_capture_sizes"] = sorted(_buckets)
     # Ascend compiler: pre-compiled static-shape kernels for captured shapes.
     additional = engine_args.setdefault("additional_config", {})
     additional.setdefault("ascend_compilation_config", {}).setdefault(
@@ -913,7 +927,7 @@ def _apply_llm_ar_submission_defaults(ps, engine_args: dict[str, Any]) -> None:
     # async scheduling only with eagle/ngram_gpu/dspark), so drop the async
     # flag for this stage; _resolve_scheduler then picks OmniARScheduler.
     if ps.stage_id == 0 and not engine_args.get("speculative_config"):
-        spec_k = int(_os.environ.get("OMNI_S0_SPEC_TOKENS", "12"))
+        spec_k = int(_os.environ.get("OMNI_S0_SPEC_TOKENS", "15"))
         if spec_k > 0:
             engine_args["speculative_config"] = {
                 "method": "ngram",

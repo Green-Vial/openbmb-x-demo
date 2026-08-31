@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 from typing import TypedDict
+
+import torch
 
 
 class DuplexIntermediateBuffer(TypedDict, total=False):
@@ -72,12 +75,42 @@ def set_tts_handoff(buffer: dict[str, object], token_ids: object | None, hidden_
         buffer.setdefault("hidden_states", {})["tts"] = hidden_states
 
 
+# P19 counterpart of the sender-side sentinel in
+# ``stage_input_processors/minicpmo_4_5_omni.py``: rebuild the tensor from the
+# raw bytes payload.  ``torch.frombuffer`` on a ``bytearray`` keeps the copy
+# local to this process (the incoming bytes object belongs to the message).
+# Floating payloads widen to float32, matching the historical nested-list
+# path (``tolist`` -> ``as_tensor(dtype=float32)``) bit-for-bit.
+_LZ_TS_KEY = "__lzy_ts__"
+
+
+def normalize_handoff_tensor(value: object) -> object:
+    if not (isinstance(value, dict) and value.get(_LZ_TS_KEY) is not None):
+        return value
+    shape = [int(d) for d in value.get("shape", [])]
+    data = value.get("data")
+    if isinstance(data, memoryview):
+        data = data.tobytes()
+    dtype_name = str(value[_LZ_TS_KEY])
+    if dtype_name == "bfloat16":
+        tensor = torch.frombuffer(bytearray(data), dtype=torch.int16).view(torch.bfloat16)
+    else:
+        tensor = torch.frombuffer(bytearray(data), dtype=getattr(torch, dtype_name))
+    tensor = tensor.reshape(shape).clone()
+    if tensor.is_floating_point() and tensor.dtype != torch.float32:
+        tensor = tensor.to(torch.float32)
+    return tensor
+
+
 def get_tts_handoff(info: dict[str, object]) -> tuple[object | None, object | None]:
     """Read the canonical handoff, including the legacy flat aliases."""
     ids_info = info.get("ids")
     hidden_info = info.get("hidden_states")
     token_ids = ids_info.get("tts") if isinstance(ids_info, dict) else None
     hidden_states = hidden_info.get("tts") if isinstance(hidden_info, dict) else None
+    if os.environ.get("OMNI_LZ_HANDOFF_LIST_LEGACY", "0") != "1":
+        token_ids = normalize_handoff_tensor(token_ids)
+        hidden_states = normalize_handoff_tensor(hidden_states)
     return (
         info.get("tts_token_ids") if token_ids is None else token_ids,
         info.get("tts_hidden_states") if hidden_states is None else hidden_states,

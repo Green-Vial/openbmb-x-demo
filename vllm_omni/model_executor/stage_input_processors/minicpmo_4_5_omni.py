@@ -3,6 +3,7 @@
 """MiniCPM-o 4.5 Thinker-to-Talker and Talker-to-Code2Wav bridges."""
 
 import logging
+import os
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
@@ -12,6 +13,7 @@ from vllm.inputs import TextPrompt
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
 from vllm_omni.experimental.fullduplex.engine.intermediate import (
     build_duplex_intermediate_buffer,
+    normalize_handoff_tensor,
     set_ref_audio,
     set_tts_handoff,
 )
@@ -149,11 +151,34 @@ def _find_tts_span(full_token_ids, tts_bos_id, tts_end_ids, prompt_len, is_nativ
     return bos_idx, eos_idx
 
 
+# P19: binary handoff transport.  A CPU tensor cannot cross stages as a tensor
+# (``model_intermediate_buffer`` rides vLLM's MsgpackEncoder via a
+# ``dict[str, Any]`` with no type hints, so the encoder degrades it to a
+# metadata list).  The historical workaround embedded the payload as ~7e5
+# Python floats via ``tolist()`` (25-45 ms per request of per-element
+# encoding).  Instead, wrap the raw contiguous bytes in a sentinel-keyed dict:
+# msgpack treats ``bytes`` as a first-class type, so the whole payload encodes
+# with a single copy and the receiver rebuilds the tensor from the sentinel.
+# Decode lives in ``get_tts_handoff``; ``OMNI_LZ_HANDOFF_LIST_LEGACY=1``
+# restores the nested-list encoding.
+_LZ_TS_KEY = "__lzy_ts__"
+
+
 def _to_transport_list(value):
     if hasattr(value, "detach"):
         value = value.detach().cpu()
     if isinstance(value, torch.Tensor):
-        return value.tolist()
+        if os.environ.get("OMNI_LZ_HANDOFF_LIST_LEGACY", "0") == "1":
+            return value.tolist()
+        value = value.contiguous()
+        # bfloat16 has no numpy dtype; ship its 2-byte payload verbatim and
+        # let the receiver widen back.  The tag records the logical dtype.
+        raw = value.view(torch.int16) if value.dtype == torch.bfloat16 else value
+        return {
+            _LZ_TS_KEY: str(value.dtype).removeprefix("torch."),
+            "shape": list(value.shape),
+            "data": raw.numpy().tobytes(),
+        }
     return value
 
 
@@ -278,6 +303,7 @@ def _extract_ref_audio(request: Any) -> tuple[torch.Tensor | None, int | None]:
     ref_audio_sr = _coerce_int(raw_ref_audio_sr)
     if raw_ref_audio is None:
         return None, ref_audio_sr
+    raw_ref_audio = normalize_handoff_tensor(raw_ref_audio)
     return torch.as_tensor(raw_ref_audio, dtype=torch.float32).reshape(-1).cpu(), ref_audio_sr
 
 

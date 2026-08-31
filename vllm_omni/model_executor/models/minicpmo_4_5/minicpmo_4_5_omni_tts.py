@@ -11,6 +11,7 @@ Pipeline:
   4. Continuously generate request-aligned discrete audio-code deltas
 """
 
+import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -32,6 +33,8 @@ from vllm_omni.platforms import current_omni_platform
 logger = init_logger(__name__)
 
 _REPETITION_WINDOW = 16
+# P23: rows of pre-drawn Exp(1) noise per request block (see _sample_audio_code).
+_LZ_GUMBEL_BLOCK = 64
 _MIN_AUDIO_TOKENS = 128
 _MAX_AUDIO_TOKENS = 2048
 _AUDIO_TOKENS_PER_TEXT_TOKEN = 10
@@ -187,8 +190,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._codec_top_p = float(getattr(tts_config, "top_p", _CODEC_TOP_P))
             self._codec_repetition_penalty = float(getattr(tts_config, "repetition_penalty", _CODEC_REPETITION_PENALTY))
             self._codec_min_tokens = int(getattr(tts_config, "min_new_tokens", _CODEC_MIN_TOKENS))
+            # P23: Gumbel-max sampling path (see _sample_audio_code). Rollback:
+            # OMNI_LZ_GUMBEL=0 restores torch.multinomial.
+            self._lz_gumbel_sampling = os.environ.get("OMNI_LZ_GUMBEL", "1") not in {"0", "false", "no", "off"}
         else:
             self._tts_config = None
+            self._lz_gumbel_sampling = False
 
         self.has_preprocess = True
         self.has_postprocess = False
@@ -432,6 +439,31 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             top_p=self._codec_top_p,
             min_tokens_to_keep=3,
         )
+        # P23 Gumbel-max reparameterisation.  ``multinomial`` consumes device
+        # RNG inside the sampling kernel chain (softmax + exp + cumdiv +
+        # draw), which both costs extra per-step kernel launches and pins the
+        # sampling op to eager (device RNG state cannot be replayed inside a
+        # graph).  The exponential-race identity
+        # ``argmax(l - log E) ~ categorical(softmax(l))`` for E ~ Exp(1)
+        # moves the randomness into a *data* input: noise is drawn eagerly in
+        # pre-generated per-request blocks (same generator, same consumption
+        # order per step), leaving only ``add`` + ``argmax`` kernels on the
+        # sampling path.  The drawn values are distribution-equal but not
+        # bit-identical to ``multinomial`` (documented, WER/SIM gated).
+        if self._lz_gumbel_sampling:
+            device = logits.device
+            state = request_states.get(request_id) if isinstance(request_states, dict) else None
+            if isinstance(state, dict):
+                noise = state.get("lz_gumbel")
+                vocab = logits.shape[-1]
+                if not isinstance(noise, torch.Tensor) or noise.device != device or noise.shape[-1] != vocab:
+                    noise = torch.empty((_LZ_GUMBEL_BLOCK, vocab), device=device)
+                row = step % _LZ_GUMBEL_BLOCK
+                if step == 0 or row == 0 or not isinstance(noise, torch.Tensor) or noise.shape[-1] != vocab:
+                    noise.exponential_(generator=self._request_generator(request_id, device))
+                    state["lz_gumbel"] = noise
+                q = noise[row : row + 1]
+                return (logits - torch.log(q.clamp_min(1e-9))).argmax(dim=-1).reshape(())
         probabilities = torch.softmax(logits, dim=-1)
         return torch.multinomial(
             probabilities,

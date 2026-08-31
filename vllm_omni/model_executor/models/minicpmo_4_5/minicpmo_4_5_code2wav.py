@@ -19,6 +19,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
+from vllm_omni.experimental.fullduplex.engine.intermediate import normalize_handoff_tensor
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 from .batched_token2wav import (
@@ -213,7 +214,21 @@ class MiniCPMO45Code2Wav(nn.Module):
         batch_sizes = tuple(
             sorted({1, max_batch})
         )
-        self.backend.warmup(prompt_wav, batch_sizes=batch_sizes)
+        # P22: exercise both live chunk widths. The stream starts with an
+        # initial chunk and continues with steady chunks (+3 left-context
+        # frames); each width owns its own graph bucket, and warmup used to
+        # pay only the steady width, leaving the lazy initial-width capture
+        # inside request #1's TTFP.
+        try:
+            chunk = int(extra.get("codec_chunk_frames", 25) or 25)
+        except (TypeError, ValueError):
+            chunk = 25
+        try:
+            initial = int(extra.get("initial_codec_chunk_frames", chunk) or chunk)
+        except (TypeError, ValueError):
+            initial = chunk
+        widths = tuple(dict.fromkeys([initial, chunk + 3]))
+        self.backend.warmup(prompt_wav, batch_sizes=batch_sizes, chunk_frames=widths)
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         return torch.zeros((input_ids.numel(), 1), device=input_ids.device, dtype=torch.float32)
@@ -276,6 +291,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         codes = info.get("codes")
         ref_audio = codes.get("ref") if isinstance(codes, Mapping) else None
         if ref_audio is not None:
+            ref_audio = normalize_handoff_tensor(ref_audio)
             cache_key, entry = self._materialize_runtime_prompt(
                 ref_audio,
                 meta.get("ref_audio_sr"),
