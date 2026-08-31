@@ -909,6 +909,9 @@ def _apply_llm_ar_submission_defaults(ps, engine_args: dict[str, Any]) -> None:
     # draft tokens exactly, so sampled ids are unchanged; the win is fewer
     # engine steps for the echo-heavy TTS prompt replay. Disabled entirely
     # when the deploy config (or caller) already chose a speculative method.
+    # The CPU ngram drafter requires the synchronous scheduler (vllm allows
+    # async scheduling only with eagle/ngram_gpu/dspark), so drop the async
+    # flag for this stage; _resolve_scheduler then picks OmniARScheduler.
     if ps.stage_id == 0 and not engine_args.get("speculative_config"):
         spec_k = int(_os.environ.get("OMNI_S0_SPEC_TOKENS", "12"))
         if spec_k > 0:
@@ -918,6 +921,7 @@ def _apply_llm_ar_submission_defaults(ps, engine_args: dict[str, Any]) -> None:
                 "prompt_lookup_max": max(10, spec_k),
                 "prompt_lookup_min": 1,
             }
+            engine_args["async_scheduling"] = False
 
 
 def _build_extras(
@@ -1005,13 +1009,19 @@ def merge_pipeline_deploy(
         # an encoder. Do not make vLLM profile dummy multimodal inputs for them.
         if not ps.requires_multimodal_data:
             engine_args.setdefault("skip_mm_profiling", True)
+        if ps.execution_type == StageExecutionType.LLM_AR:
+            # May inject the thinker ngram drafter; the CPU ngram variant is
+            # only supported under the synchronous scheduler (vllm restricts
+            # async scheduling to eagle/ngram_gpu/dspark), so this must run
+            # before _resolve_scheduler reads async_scheduling — the injector
+            # clears the flag for the stage that gets the drafter.
+            _apply_llm_ar_submission_defaults(ps, engine_args)
         sched_cls = _resolve_scheduler(
             ps.execution_type,
             engine_args.get("async_scheduling", True),
         )
         if ps.execution_type == StageExecutionType.LLM_AR:
             engine_args["async_scheduling"] = sched_cls is OmniARAsyncScheduler
-            _apply_llm_ar_submission_defaults(ps, engine_args)
         extras = _build_extras(ps, ds)
         runtime: dict[str, Any] = {"process": True}
         if ds is not None:
