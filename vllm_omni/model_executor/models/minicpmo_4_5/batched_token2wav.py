@@ -108,6 +108,74 @@ class BatchedToken2WavState:
 _LZ_SEED_STATE_MAX = 8
 
 
+# P28: fused AdaLN-Zero (AscendC custom kernel), opt-in via OMNI_LZ_ADALN_FUSED=1.
+_LZ_ADALN_PATCH_APPLIED = False
+
+
+def _lz_fused_dit_block_forward_chunk(
+    self: Any,
+    x: torch.Tensor,
+    c: torch.Tensor,
+    cnn_cache: Any = None,
+    att_cache: Any = None,
+    mask: Any = None,
+):
+    """DiTBlock.forward_chunk with the modulate(norm(x)) sites fused (P28).
+
+    Mirrors cosyvoice2.flow.decoder_dit.DiTBlock.forward_chunk line-by-line;
+    only the three ``modulate(self.normN(x), shiftN, scaleN)`` computations
+    are replaced by the fused AdaLN kernel (one launch instead of the
+    LN / (1+scale) / mul / add chain). Attention/conv/mlp/cache semantics,
+    including the returned (new_cnn_cache, new_att_cache) shapes, are
+    unchanged. The gate-residual adds stay eager because the gate applies to
+    the *submodule output* in this model, not to the modulated input.
+    """
+    from vllm_omni.model_executor.models.minicpmo_4_5.lz_adaln_fused import fused_adaln_norm
+
+    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp, shift_conv, scale_conv, gate_conv = (
+        self.adaLN_modulation(c).chunk(9, dim=-1)
+    )
+    # attention
+    x_att, new_att_cache = self.attn.forward_chunk(fused_adaln_norm(x, shift_msa, scale_msa), att_cache, mask)
+    x = x + gate_msa * x_att
+    # conv
+    x_conv, new_cnn_cache = self.conv.forward_chunk(fused_adaln_norm(x, shift_conv, scale_conv), cnn_cache)
+    x = x + gate_conv * x_conv
+    # mlp
+    x = x + gate_mlp * self.mlp(fused_adaln_norm(x, shift_mlp, scale_mlp))
+    return x, new_cnn_cache, new_att_cache
+
+
+def _apply_lz_adaln_fused_patch() -> bool:
+    """Replace the site-packages ``DiTBlock.forward_chunk`` with the fused variant.
+
+    Enabled only by OMNI_LZ_ADALN_FUSED=1 (checked by the caller). Follows the
+    existing monkey-patch precedent (Patched Step-Audio2 HiFT downsample): the
+    class method is swapped once per process and the original behaviour is
+    recoverable by leaving the env unset. When the AscendC kernel cannot be
+    loaded, ``fused_adaln_norm`` transparently runs the identical eager chain,
+    so correctness never depends on the kernel.
+    """
+    global _LZ_ADALN_PATCH_APPLIED
+    if _LZ_ADALN_PATCH_APPLIED:
+        return True
+    try:
+        from cosyvoice2.flow.decoder_dit import DiTBlock
+    except Exception as exc:  # noqa: BLE001 - patching is best-effort
+        logger.warning("P28 fused AdaLN patch skipped (cosyvoice2 unavailable): %s", exc)
+        return False
+    DiTBlock.forward_chunk = _lz_fused_dit_block_forward_chunk
+    _LZ_ADALN_PATCH_APPLIED = True
+    try:
+        from vllm_omni.model_executor.models.minicpmo_4_5.lz_adaln_fused import is_available
+
+        kernel_state = "ascendc-kernel" if is_available() else "eager-fallback"
+    except Exception:  # noqa: BLE001
+        kernel_state = "unknown"
+    logger.info("P28 fused AdaLN-Zero patch applied to DiTBlock.forward_chunk (%s)", kernel_state)
+    return True
+
+
 class BatchedToken2Wav(nn.Module):
     """Drive Token2wav's modules with dynamically-sized, request-owned caches.
 
@@ -203,6 +271,10 @@ class BatchedToken2Wav(nn.Module):
         self._hift_graph_dead = False
         if self._hift_graph_enabled:
             self._patch_hift_for_graph()
+        # P28: opt-in fused AdaLN-Zero for the DiT estimator. Default off
+        # (OMNI_LZ_ADALN_FUSED=0 keeps the site-packages forward_chunk).
+        if os.environ.get("OMNI_LZ_ADALN_FUSED", "0") == "1":
+            _apply_lz_adaln_fused_patch()
 
     def prepare_prompt(self, prompt_cache_id: str, prompt_wav: str) -> PromptFeatures:
         cache_key = (prompt_cache_id, prompt_wav)
