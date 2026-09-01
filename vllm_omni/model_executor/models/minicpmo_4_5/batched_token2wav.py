@@ -146,6 +146,86 @@ def _lz_fused_dit_block_forward_chunk(
     return x, new_cnn_cache, new_att_cache
 
 
+# P28b: fused QK-norm (AscendC custom kernel), opt-in via OMNI_LZ_QKNORM_FUSED=1.
+_LZ_QKNORM_PATCH_APPLIED = False
+
+
+def _lz_fused_attn_forward_chunk(
+    self: Any,
+    x: torch.Tensor,
+    att_cache: Any = None,
+    attn_mask: Any = None,
+):
+    """Attention.forward_chunk with q_norm/k_norm fused into one kernel (P28b).
+
+    Mirrors cosyvoice2.flow.decoder_dit.Attention.forward_chunk line-by-line;
+    only the ``self.q_norm(q)`` / ``self.k_norm(k)`` pair is replaced by the
+    fused op (one launch, strided views consumed in place). Cache handling,
+    SDPA call, projection and the returned new_att_cache are unchanged.
+    """
+    from vllm_omni.model_executor.models.minicpmo_4_5.lz_qknorm_fused import fused_qk_norm
+
+    b, t, c = x.shape
+
+    q = self.to_q(x)
+    k = self.to_k(x)
+    v = self.to_v(x)
+
+    q = self.to_heads(q)  # (b, nh, t, hd) transposed view — consumed strided
+    k = self.to_heads(k)
+    v = self.to_heads(v)
+
+    q, k = fused_qk_norm(
+        q, k, self.q_norm.weight, self.q_norm.bias, self.k_norm.weight, self.k_norm.bias,
+        self.q_norm.eps,
+    )
+
+    # unpack {k,v}_cache
+    if att_cache is not None:
+        k_cache, v_cache = att_cache.chunk(2, dim=3)
+        k = torch.cat([k, k_cache], dim=2)
+        v = torch.cat([v, v_cache], dim=2)
+
+    # new {k,v}_cache
+    new_att_cache = torch.cat([k, v], dim=3)
+    if attn_mask is not None:
+        attn_mask = attn_mask.unsqueeze(1)
+    x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)  # (b, nh, t, hd)
+    x = x.transpose(1, 2).reshape(b, t, -1)
+    x = self.proj(x)
+    x = self.proj_drop(x)
+    return x, new_att_cache
+
+
+def _apply_lz_qk_norm_fused_patch() -> bool:
+    """Replace site-packages ``Attention.forward_chunk`` with the fused variant.
+
+    Independent of the P28 DiTBlock patch (both can be enabled together; the
+    DiTBlock patch calls ``self.attn.forward_chunk``, which lands here once the
+    class method is swapped). Opt-in via OMNI_LZ_QKNORM_FUSED=1; when the
+    kernel cannot be loaded, ``fused_qk_norm`` runs the exact eager pair, so
+    correctness never depends on the kernel.
+    """
+    global _LZ_QKNORM_PATCH_APPLIED
+    if _LZ_QKNORM_PATCH_APPLIED:
+        return True
+    try:
+        from cosyvoice2.flow.decoder_dit import Attention
+    except Exception as exc:  # noqa: BLE001 - patching is best-effort
+        logger.warning("P28b fused QK-norm patch skipped (cosyvoice2 unavailable): %s", exc)
+        return False
+    Attention.forward_chunk = _lz_fused_attn_forward_chunk
+    _LZ_QKNORM_PATCH_APPLIED = True
+    try:
+        from vllm_omni.model_executor.models.minicpmo_4_5.lz_qknorm_fused import is_available
+
+        kernel_state = "ascendc-kernel" if is_available() else "eager-fallback"
+    except Exception:  # noqa: BLE001
+        kernel_state = "unknown"
+    logger.info("P28b fused QK-norm patch applied to Attention.forward_chunk (%s)", kernel_state)
+    return True
+
+
 def _apply_lz_adaln_fused_patch() -> bool:
     """Replace the site-packages ``DiTBlock.forward_chunk`` with the fused variant.
 
@@ -275,6 +355,10 @@ class BatchedToken2Wav(nn.Module):
         # (OMNI_LZ_ADALN_FUSED=0 keeps the site-packages forward_chunk).
         if os.environ.get("OMNI_LZ_ADALN_FUSED", "0") == "1":
             _apply_lz_adaln_fused_patch()
+        # P28b: opt-in fused QK-norm for the attention modules (independent
+        # switch; OMNI_LZ_QKNORM_FUSED=0 keeps the site-packages forward_chunk).
+        if os.environ.get("OMNI_LZ_QKNORM_FUSED", "0") == "1":
+            _apply_lz_qk_norm_fused_patch()
 
     def prepare_prompt(self, prompt_cache_id: str, prompt_wav: str) -> PromptFeatures:
         cache_key = (prompt_cache_id, prompt_wav)

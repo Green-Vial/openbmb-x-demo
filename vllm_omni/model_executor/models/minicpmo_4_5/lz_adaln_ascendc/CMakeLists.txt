@@ -31,7 +31,9 @@ set(TORCH_NPU_LIBRARIES ${TORCH_NPU_PATH}/lib)
 
 add_library(lz_adaln_ops SHARED
     op_kernel/lz_adaln_gate_kernel.asc
+    op_kernel/lz_qk_norm_kernel.asc
     op_extension/lz_adaln_torch.cpp
+    op_extension/lz_qk_norm_torch.cpp
     op_extension/lz_adaln_register.cpp
 )
 
