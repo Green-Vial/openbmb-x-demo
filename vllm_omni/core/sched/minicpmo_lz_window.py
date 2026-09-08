@@ -48,7 +48,13 @@ MAX_LOCAL_K = 16
 # Stage-1 Talker architectures whose model-side sampling advances per-request
 # codec state inside make_omni_output; the window relies on that in-place
 # state chain, so other archs never enter a window.
-WINDOW_MODEL_ARCHS = frozenset({"MiniCPMO45OmniTTSForConditionalGeneration"})
+WINDOW_MODEL_ARCHS = frozenset({
+    "MiniCPMO45OmniTTSForConditionalGeneration",
+    # Stage engines resolve architectures from the pipeline-level arch (the
+    # tts stage declares no per-stage model_arch), so the scheduler sees the
+    # wrapper-family name rather than the inner TTS class name.
+    "MiniCPMO45OmniForConditionalGeneration",
+})
 
 
 def resolve_local_k(raw: str | int | None = None) -> int:
@@ -94,6 +100,11 @@ def scheduler_allows_window(scheduler: Any) -> bool:
     model_config = vllm_config.model_config
     archs = set(getattr(model_config, "architectures", None) or ())
     if not archs & WINDOW_MODEL_ARCHS:
+        return False
+    # The window relies on the Talker's request-local codec state chain; the
+    # thinker stage of the same wrapper family shares the arch name and must
+    # never open windows.
+    if getattr(model_config, "model_stage", None) != "tts":
         return False
     if not getattr(scheduler.scheduler_config, "async_scheduling", False):
         return False

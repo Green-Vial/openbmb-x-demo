@@ -833,6 +833,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             reached_limit = int(state["step"]) >= int(state.get("max_tokens", 2048))
             finished = is_eos or reached_limit
             state["finished"] = finished
+            # Equivalence probe (env-gated): one line per sampled codec token,
+            # request-local and order-stable, so windowed and single-step runs
+            # can be diffed line by line.  Audio bytes are NOT comparable
+            # run-to-run because the HiFT SineGen draws unseeded noise.
+            _dump = os.environ.get("OMNI_LZ_CODEC_DUMP")
+            if _dump:
+                with open(_dump, "a") as _f:
+                    _f.write(f"{request_id} {state['step']} {sampled_id} {int(finished)}\n")
             # MiniCPMTTS.generate_chunk consumes the boundary sample but
             # returns only codes that were fed into the retained KV state.
             if not is_eos and not reached_limit:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections import defaultdict
 from time import time
 from typing import Any
@@ -293,8 +294,19 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # leaves the output untouched and the normal single-step path runs.
         try:
             local_k = resolve_local_k()
+            _lzprobe = os.environ.get("OMNI_LZ_PROBE", "0") not in ("", "0")
+            if _lzprobe and local_k > 0:
+                logger.info(
+                    "LZ probe: local_k=%d allows_window=%s archs=%s async=%s",
+                    local_k,
+                    scheduler_allows_window(self),
+                    set(getattr(self.vllm_config.model_config, "architectures", None) or ()),
+                    getattr(self.scheduler_config, "async_scheduling", None),
+                )
             if local_k > 0 and scheduler_allows_window(self):
-                plan_lz_window(self, scheduler_output, local_k)
+                did = plan_lz_window(self, scheduler_output, local_k)
+                if _lzprobe:
+                    logger.info("LZ probe: plan_lz_window -> %s", did)
         except Exception:
             logger.exception("LZ window planning failed; falling back to single step")
 

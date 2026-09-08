@@ -139,6 +139,9 @@ def test_resolve_local_k_reads_env(monkeypatch):
 def make_vllm_config(**overrides):
     model_config = SimpleNamespace(
         architectures=[next(iter(WINDOW_MODEL_ARCHS))],
+        # Stage engines see the pipeline-level arch; the window is
+        # talker-only, so the gate also requires the tts stage.
+        model_stage="tts",
         is_encoder_decoder=False,
         enable_return_routed_experts=False,
     )

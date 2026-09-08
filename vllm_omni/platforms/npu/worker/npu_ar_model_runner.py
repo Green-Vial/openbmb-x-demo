@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Mapping
 from copy import copy, deepcopy
@@ -472,6 +473,12 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         lz_window_plan = self._lz_window_plan(scheduler_output)
         if lz_window_plan is not None:
             self._execute_lz_window(scheduler_output, lz_window_plan)
+            # Periodic worker-side diagnostic: a non-zero executed count proves
+            # windows actually run on this stack (vs. being refused every step).
+            n_exec_glb = getattr(self, "_lz_exec_count", 0) + 1
+            self._lz_exec_count = n_exec_glb
+            if n_exec_glb == 1 or n_exec_glb % 25 == 0:
+                logger.info("LZ window run #%d (worker)", n_exec_glb)
             return None
         #  -------------------------------------- Omni-new -------------------------------------------------
 
@@ -1339,90 +1346,108 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         normal single-step path runs and the scheduler-side reconcile in
         update_from_output repairs the reservation shortfall (fail-closed).
         """
+        _probe = os.environ.get("OMNI_LZ_PROBE", "0") not in ("", "0")
+
+        def _refuse(reason: str) -> None:
+            if _probe:
+                logger.info("LZ runner refuse: %s", reason)
+            return None
+
         try:
             plan = getattr(scheduler_output, "lz_window_steps", None)
             if not plan:
+                # The overwhelmingly common case (every non-windowed step);
+                # logging it would flood the probe.
                 return None
             window_sizes = set(plan.values())
             if len(window_sizes) != 1:
-                return None
+                return _refuse("mixed_window_sizes")
             window_k = window_sizes.pop()
             if window_k < 2:
-                return None
+                return _refuse("k_lt_2")
             num_scheduled = scheduler_output.num_scheduled_tokens
             if set(num_scheduled) != set(plan) or any(n != window_k for n in num_scheduled.values()):
-                return None
+                return _refuse("num_scheduled_mismatch")
             if (
                 scheduler_output.scheduled_new_reqs
                 or scheduler_output.scheduled_spec_decode_tokens
                 or scheduler_output.scheduled_encoder_inputs
             ):
-                return None
+                return _refuse("new_or_spec_or_encoder")
             if not self.use_async_scheduling:
-                return None
+                return _refuse("no_async_scheduling")
+            # The window relies on the Talker's request-local codec state
+            # chain; the thinker stage of the same wrapper family must never
+            # host windows (defense in depth against the scheduler gate).
+            if getattr(self.model_config, "model_stage", None) != "tts":
+                return _refuse("not_tts_stage")
             if self.num_spec_tokens or self.speculative_config is not None:
-                return None
+                return _refuse("spec_decode")
             pp_group = get_pp_group()
             if pp_group.world_size != 1 or not pp_group.is_last_rank or get_tp_group().world_size != 1:
-                return None
+                return _refuse("pp_tp")
             if (
                 self.vllm_config.parallel_config.data_parallel_size != 1
                 or self.pcp_size != 1
                 or self.dcp_size != 1
                 or self.use_cp
             ):
-                return None
+                return _refuse("dp_pcp_dcp_cp")
             if self.lora_config is not None or self.is_pooling_model:
-                return None
-            if self.model_config.is_encoder_decoder or self.supports_mm_inputs:
-                return None
+                return _refuse("lora_or_pooling")
+            # NOTE: the wrapper architecture legitimately reports
+            # supports_mm_inputs for the tts stage even though its decode path
+            # consumes plain token ids (preprocess() rebuilds embeddings from
+            # the request-local state chain), so it is not refused here.
+            if self.model_config.is_encoder_decoder:
+                return _refuse("enc_dec")
             if self.omni_prefix_cache is not None:
-                return None
+                return _refuse("prefix_cache")
             if getattr(self, "has_talker_mtp", False):
-                return None
-            if self._resolve_duplex_sampling_hook() is not None:
-                return None
+                return _refuse("talker_mtp")
+            # NOTE: no duplex-hook refusal here -- the window loop mirrors
+            # _sample's custom-sampler branch (logit bias, _apply_duplex_
+            # sampling, model sampler), so a registered duplex hook is applied
+            # inside the window exactly like the single-step path.
             if getattr(self.cache_config, "mamba_cache_mode", "off") == "align":
-                return None
+                return _refuse("mamba_align")
             if self.model_config.enable_return_routed_experts:
-                return None
+                return _refuse("routed_experts")
             if getattr(self, "calculate_kv_scales", False):
-                return None
+                return _refuse("kv_scales")
             if getattr(self, "dynamic_eplb", False):
-                return None
+                return _refuse("dynamic_eplb")
             if self.debugger is not None:
-                return None
+                return _refuse("debugger")
             if self.ascend_config.profiling_chunk_config.enabled:
-                return None
+                return _refuse("profiling_chunk")
             if has_ec_transfer() and get_ec_transfer().is_producer:
-                return None
+                return _refuse("ec_transfer_producer")
             model = self.model
             if not getattr(model, "has_preprocess", False) or not hasattr(model, "make_omni_output"):
-                return None
-            if getattr(model, "prefer_model_sampler", False):
-                return None
+                return _refuse("model_contract_missing")
+            # NOTE: no prefer_model_sampler refusal here -- the window loop
+            # mirrors _sample's custom-sampler branch (logit bias, duplex,
+            # model sampler), so prefer_model_sampler models host windows with
+            # identical sampling semantics.  No batch-identity / prefill-phase
+            # re-checks either: under async scheduling the runner's input_batch
+            # view lags the scheduler (validation runs before _update_states
+            # syncs it), so those checks produce false refusals; the scheduler
+            # side gates batch composition and decode phase authoritatively.
             sampling_metadata = self.input_batch.sampling_metadata
             if not sampling_metadata.no_penalties:
-                return None
+                return _refuse("penalties")
             if self.input_batch.bad_words_token_ids:
-                return None
+                return _refuse("bad_words")
             if not self.input_batch.no_allowed_token_ids:
-                return None
+                return _refuse("allowed_token_ids")
             if self.input_batch.logprob_token_ids:
-                return None
+                return _refuse("logprob_token_ids")
             max_num_logprobs = sampling_metadata.max_num_logprobs
             if max_num_logprobs is not None and max_num_logprobs > 0:
-                return None
+                return _refuse("max_num_logprobs")
             if self.num_prompt_logprobs:
-                return None
-            num_reqs = self.input_batch.num_reqs
-            if num_reqs != len(plan) or set(self.input_batch.req_ids) != set(plan):
-                return None
-            if np.any(
-                self.input_batch.num_computed_tokens_cpu[:num_reqs]
-                < self.input_batch.num_prompt_tokens[:num_reqs]
-            ):
-                return None
+                return _refuse("prompt_logprobs")
             return plan
         except Exception:
             logger.exception("LZ window plan validation failed; using single-step decode")
@@ -1436,9 +1461,6 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         engine's execute_model -> sample_tokens contract.
         """
         window_k = next(iter(plan.values()))
-        num_reqs = self.input_batch.num_reqs
-        req_ids = list(self.input_batch.req_ids)
-        ones = np.ones(num_reqs, dtype=np.int32)
 
         with record_function_or_nullcontext("lz_window"):
             with self.synchronize_input_prep():
@@ -1447,6 +1469,12 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     # Mamba/spec corrections are gated off for windows; apply
                     # eagerly so per-step state starts consistent.
                     deferred_state_corrections_fn()
+
+                # Batch identity must be read after _update_states: under
+                # async scheduling the pre-update view lags the scheduler.
+                num_reqs = self.input_batch.num_reqs
+                req_ids = list(self.input_batch.req_ids)
+                ones = np.ones(num_reqs, dtype=np.int32)
 
                 # Uniform decode layout: one query token per request, frozen
                 # for the whole window.
@@ -1649,7 +1677,28 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         # Fill the previous engine step's pending placeholder
                         # exactly like the normal _sample path would.
                         self.input_batch.update_async_output_token_ids()
-                    sampler_output = self.sampler(logits=logits, sampling_metadata=sampling_metadata)
+                    # Mirror _sample's sampler selection (without the
+                    # update_async_output_token_ids call, which must run once
+                    # per engine step, not per window step): the wrapper
+                    # declares prefer_model_sampler for the tts stage, so the
+                    # single-step path runs logit bias + duplex + the
+                    # model-side sampler; the window must use the same chain
+                    # or the sampled token diverges.
+                    model_sample = getattr(self.model, "sample", None)
+                    sampler_output = None
+                    if callable(model_sample) and getattr(self.model, "prefer_model_sampler", False):
+                        if hasattr(self.sampler, "logit_bias_state") and self.sampler.logit_bias_state is not None:
+                            self.sampler.logit_bias_state.apply_logit_bias(
+                                logits,
+                                self.input_batch.expanded_idx_mapping,
+                                self.input_batch.idx_mapping_np,
+                                self.input_batch.positions[self.input_batch.logits_indices],
+                            )
+                        prepared_sampling_metadata = self._sampling_metadata_for_model_sampler(sampling_metadata)
+                        self._apply_duplex_sampling(logits, prepared_sampling_metadata)
+                        sampler_output = model_sample(logits, prepared_sampling_metadata)
+                    if sampler_output is None:
+                        sampler_output = self.sampler(logits=logits, sampling_metadata=sampling_metadata)
                     sampled_steps.append(sampler_output.sampled_token_ids)
 
                     # Mirror _bookkeeping_sync's async bookkeeping: one -1
