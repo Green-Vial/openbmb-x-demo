@@ -86,6 +86,8 @@ python -m examples.online_serving.minicpmo.realtime_web \
 
 架构与生命周期不变量见 [`vllm_omni/experimental/fullduplex/DESIGN.md`](vllm_omni/experimental/fullduplex/DESIGN.md)；上游原始说明见 [`docs/README_upstream.md`](docs/README_upstream.md)。
 
+**已知限制**：Talker 的上下文为 4096 token（模型硬限制）。全双工会话中若单轮回应接近 `max_tokens`（2048 audio token ≈ 82 秒语音），下一轮重建的会话请求会超出该容量——当前版本引擎侧缺少对这种情况的优雅守卫，会以引擎错误结束。短多轮对话不受影响；会话级历史截断 / 容量守卫在计划中。
+
 ## 优化 Commit 全览
 
 基线为 vLLM-Omni 官方 `minicpm-challenge` 分支（`11dcde9`）。以下 28 个 commit 按主题分组，全部独立可回滚（env 开关或 `git revert`）。
