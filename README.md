@@ -96,7 +96,7 @@ python -m examples.online_serving.minicpmo.realtime_web \
 
 | Commit | 优化 |
 |---|---|
-| `a63bcba4` | **P24 runner-local K 窗口解码**：调度器把单步批发为 K-token 步（预分配 KV + 占位符记账），runner 单次 `execute_model` 内连跑 K 步，摊薄引擎循环固定开销；fail-closed 三层门控，25 项单测 |
+| `a63bcba4` | **P24 多步合并解码 PR#7064**：调度器把单步批发为 K-token 步（预分配 KV + 占位符记账），runner 单次 `execute_model` 内连跑 K 步，摊薄引擎循环固定开销；fail-closed 三层门控，25 项单测 |
 | `d2f21710` | P24 默认窗口 K 8 → 10 |
 | `e83f4c48` | **P24 修复**：修三层拒绝门（架构名不匹配 / prefer_model_sampler / mm_inputs / duplex hook / 过期批视图），窗口真实生效；codec 流逐位等价验证；c1x32 实测 E2EL -17.5%、RTF -16.8% |
 | `7f2fa613` | C2.1 Code2Wav CFM 步数 10 → 3 |
